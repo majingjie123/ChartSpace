@@ -52,7 +52,7 @@ const app = createApp({
       // ---- AI 配置 ----
       aiConfigs: [],
       showAIConfigModal: false,
-      editAIConfig: null,
+      // editAIConfig handled by editingAIConfigId
       aiConfigForm: {
         name: '', base_url: '', api_key: '', model: 'gpt-3.5-turbo',
         system_prompt: '你是一个数据分析助手，基于用户上传的 Excel 数据回答问题。',
@@ -466,7 +466,6 @@ const app = createApp({
     },
 
     openAIConfigModal() {
-      this.editAIConfig = null;
       this.editingAIConfigId = null;
       this.resetAIConfigForm();
       this.loadAIConfigs();
@@ -482,7 +481,7 @@ const app = createApp({
       this.editingAIConfigId = null;
     },
 
-    editAIConfigHandler(config) {
+    editAIConfig(config) {
       this.editingAIConfigId = config.id;
       this.aiConfigForm = {
         name: config.name,
@@ -503,7 +502,7 @@ const app = createApp({
         return;
       }
       try {
-        if (this.editingAIConfigId) {
+        if (this.editingAIConfigId && this.editingAIConfigId > 0) {
           await this.api('PUT', `/ai-configs/${this.editingAIConfigId}`, f);
           this.toast('AI 配置已更新');
         } else {
@@ -680,6 +679,20 @@ const app = createApp({
       if (direction === '上升') return '↑';
       if (direction === '下降') return '↓';
       return '→';
+    },
+
+    chartTypeLabel(type) {
+      const labels = { scatter: '散点图', line: '折线图', bar: '柱状图', box: '箱线图', area: '面积图', pie: '饼图' };
+      return labels[type] || type;
+    },
+
+    renderMarkdown(text) {
+      if (!text) return '';
+      return text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/\n/g, '<br>').replace(/```([\s\S]*?)```/g, '<pre><code>$1</code></pre>').replace(/`([^`]+)`/g, '<code>$1</code>').replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>').replace(/\*(.+?)\*/g, '<em>$1</em>');
+    },
+
+    exportTrendCsv(chartId) {
+      window.open('/api/charts/' + chartId + '/export-csv', '_blank');
     }
   },
 

@@ -1,1 +1,681 @@
-test content
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Excel 多空间智能图表分析工具</title>
+  <!-- Bootstrap 5 CSS -->
+  <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet">
+  <!-- Plotly.js -->
+  <script src="https://cdn.plot.ly/plotly-2.35.2.min.js" charset="utf-8"></script>
+  <!-- Vue 3 -->
+  <script src="https://cdn.jsdelivr.net/npm/vue@3.5.13/dist/vue.global.prod.js"></script>
+  <!-- Axios -->
+  <script src="https://cdn.jsdelivr.net/npm/axios@1.7.9/dist/axios.min.js"></script>
+  <!-- 全局样式 -->
+  <link rel="stylesheet" href="(( url_for('static', filename='css/style.css') ))">
+</head>
+<body>
+<div id="app">
+  <!-- ==================== Toast 通知 ==================== -->
+  <div class="toast-container">
+    <div v-for="t in toasts" :key="t.id"
+         class="toast-notification"
+         :class="t.type">
+      {{ t.msg }}
+    </div>
+  </div>
+
+  <!-- ==================== 三栏布局 ==================== -->
+  <div class="app-layout">
+
+    <!-- ========== 左侧边栏 ========== -->
+    <aside class="left-sidebar">
+      <div class="sidebar-header">
+        <h5>📊 ChartSpace</h5>
+        <small>多空间数据分析</small>
+      </div>
+
+      <!-- 空间列表 -->
+      <div class="sidebar-section">
+        <div class="d-flex justify-content-between align-items-center mb-2 px-3">
+          <span style="font-size:12px;color:var(--text-light);font-weight:500;">工作空间</span>
+          <button class="btn-new-space" @click="createSpace" title="新建空间">+</button>
+        </div>
+        <div class="space-list" v-if="spaces.length > 0">
+          <div v-for="sp in spaces" :key="sp.id"
+               class="space-item"
+               :class="{ active: sp.id === currentSpaceId }"
+               @click="switchSpace(sp.id)">
+            <div class="space-icon">{{ sp.name.charAt(0).toUpperCase() }}</div>
+            <div class="space-name" :title="sp.name">{{ sp.name }}</div>
+            <div class="space-actions">
+              <button class="btn-icon" title="删除空间" @click.stop="deleteSpace(sp.id)">🗑</button>
+            </div>
+          </div>
+        </div>
+        <div v-else class="px-3" style="color:var(--text-light);font-size:13px;padding:12px 0;">
+          暂无空间，点击 + 创建
+        </div>
+      </div>
+
+      <!-- 底部按钮 -->
+      <div class="sidebar-footer">
+        <button class="btn-sidebar" @click="showAIConfigModal = true; resetAIConfigForm();">🤖 AI 配置</button>
+        <button class="btn-sidebar" @click="openBackupModal()">💾 备份恢复</button>
+      </div>
+    </aside>
+
+    <!-- ========== 中间主区域 ========== -->
+    <main class="main-content">
+      <!-- 顶栏 -->
+      <div class="main-header">
+        <div class="space-title" v-if="currentSpace">
+          <template v-if="renamingSpace">
+            <input v-model="renameSpaceName"
+                   @keyup.enter="confirmRenameSpace"
+                   @keyup.escape="cancelRenameSpace"
+                   @blur="confirmRenameSpace"
+                   ref="renameInput"
+                   autofocus>
+          </template>
+          <template v-else>
+            <span @dblclick="startRenameSpace" :title="'双击重命名'">{{ currentSpace.name }}</span>
+          </template>
+        </div>
+        <div class="space-title" v-else style="color:var(--text-secondary);">请选择或创建工作空间</div>
+        <div class="header-actions" v-if="currentSpace">
+          <button class="btn btn-outline-primary btn-sm" @click="openUploadModal()">📤 上传 Excel</button>
+          <button class="btn btn-outline-primary btn-sm" @click="exportSpace()">📦 导出空间</button>
+        </div>
+      </div>
+
+      <!-- 主内容 -->
+      <div class="main-body" v-if="currentSpace">
+        <!-- 数据集区 -->
+        <div class="d-flex justify-content-between align-items-center mb-2">
+          <div class="section-title">📁 数据集</div>
+        </div>
+        <div v-if="datasets.length === 0 && !loading.datasets" class="empty-state">
+          <div class="empty-icon">📂</div>
+          <h5>暂无数据集</h5>
+          <p>点击上方「上传 Excel」按钮导入数据</p>
+        </div>
+        <div v-for="ds in datasets" :key="ds.id" class="dataset-card">
+          <div class="ds-info">
+            <div class="ds-name">{{ ds.name }}</div>
+            <div class="ds-meta">{{ ds.row_count || '?' }} 行 · {{ ds.column_count || '?' }} 列</div>
+          </div>
+          <div class="ds-actions">
+            <button class="btn btn-sm btn-outline-secondary" @click="deleteDataset(ds.id)" title="删除数据集">🗑</button>
+          </div>
+        </div>
+
+        <hr class="section-divider">
+
+        <!-- 图表区 -->
+        <div class="d-flex justify-content-between align-items-center mb-2">
+          <div class="section-title">📈 图表</div>
+          <button class="btn btn-primary btn-sm" @click="openNewChartModal()" :disabled="datasets.length === 0">+ 新建图表</button>
+        </div>
+        <div v-if="charts.length === 0 && !loading.charts" class="empty-state">
+          <div class="empty-icon">📊</div>
+          <h5>暂无图表</h5>
+          <p>导入数据集后点击「新建图表」创建可视化</p>
+        </div>
+        <div class="chart-grid" v-if="charts.length > 0">
+          <div v-for="ch in charts" :key="ch.id" class="chart-card">
+            <div class="chart-header">
+              <span class="chart-name">{{ ch.name }}</span>
+              <span class="chart-type-badge">{{ chartTypeLabel(ch.chart_type) }}</span>
+              <div class="chart-actions">
+                <button class="btn btn-sm btn-outline-secondary" @click="openEditChartModal(ch)" title="编辑图表">✏️</button>
+                <button class="btn btn-sm btn-outline-secondary" @click="deleteChart(ch.id)" title="删除图表">🗑</button>
+                <button class="btn btn-sm btn-outline-secondary" @click="exportChartCsv(ch)" title="导出 CSV">📄</button>
+                <button class="btn btn-sm btn-outline-secondary" @click="exportChartImage(ch)" title="导出图片">🖼</button>
+              </div>
+            </div>
+            <div class="chart-body">
+              <!-- 图表渲染容器 -->
+              <div :id="'chart-' + ch.id" style="width:100%;height:340px;"></div>
+              <!-- 加载动画 -->
+              <div v-if="chartLoading[ch.id]" class="loading-overlay">
+                <div class="loading-spinner"></div>
+              </div>
+            </div>
+            <!-- 趋势分析面板 -->
+            <div v-if="trendInfos[ch.id]" class="trend-panel">
+              <div class="trend-grid">
+                <div class="trend-item">
+                  <div class="trend-label">斜率</div>
+                  <div class="trend-value">{{ trendInfos[ch.id].slope.toFixed(4) }}</div>
+                </div>
+                <div class="trend-item">
+                  <div class="trend-label">截距</div>
+                  <div class="trend-value">{{ trendInfos[ch.id].intercept.toFixed(4) }}</div>
+                </div>
+                <div class="trend-item">
+                  <div class="trend-label">R²</div>
+                  <div class="trend-value">{{ trendInfos[ch.id].r2.toFixed(4) }}</div>
+                </div>
+                <div class="trend-item">
+                  <div class="trend-label">趋势</div>
+                  <div class="trend-value" :class="trendValueClass(trendInfos[ch.id].direction)">
+                    {{ trendIcon(trendInfos[ch.id].direction) }} {{ trendInfos[ch.id].direction }}
+                  </div>
+                </div>
+              </div>
+              <div v-if="trendInfos[ch.id].predictions && trendInfos[ch.id].predictions.length > 0">
+                <div style="font-size:12px;font-weight:600;margin-bottom:4px;color:var(--text-secondary);">📊 未来 3 期预测</div>
+                <table class="predict-table">
+                  <thead><tr><th>#</th><th>X</th><th>Y 预测</th></tr></thead>
+                  <tbody>
+                    <tr v-for="(p, pi) in trendInfos[ch.id].predictions" :key="pi">
+                      <td>{{ pi + 1 }}</td>
+                      <td>{{ typeof p.x === 'number' ? p.x.toFixed(2) : p.x }}</td>
+                      <td>{{ p.y_pred.toFixed(2) }}</td>
+                    </tr>
+                  </tbody>
+                </table>
+              </div>
+              <div class="mt-1">
+                <button class="btn btn-sm btn-outline-secondary" @click="exportTrendCsv(ch.id)">📄 导出趋势数据 CSV</button>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- 未选择空间 -->
+      <div class="main-body" v-else>
+        <div class="empty-state" style="margin-top:80px;">
+          <div class="empty-icon">📊</div>
+          <h5>欢迎使用 ChartSpace</h5>
+          <p>从左侧选择一个工作空间，或创建新空间开始分析</p>
+        </div>
+      </div>
+    </main>
+
+    <!-- ========== 右侧面板 ========== -->
+    <aside class="right-panel" v-if="currentSpace">
+      <div class="panel-tabs">
+        <button class="tab-btn" :class="{ active: activeTab === 'chat' }" @click="activeTab = 'chat'">💬 AI 对话</button>
+        <button class="tab-btn" :class="{ active: activeTab === 'notes' }" @click="activeTab = 'notes'">📝 笔记</button>
+      </div>
+      <div class="panel-content">
+        <!-- AI 对话 Tab -->
+        <div class="tab-pane" :class="{ active: activeTab === 'chat' }">
+          <div class="chat-area">
+            <div class="chat-header">
+              <select class="form-select form-select-sm" v-model="selectedAiDatasetId">
+                <option :value="null">不绑定数据集</option>
+                <option v-for="ds in datasets" :key="ds.id" :value="ds.id">{{ ds.name }}</option>
+              </select>
+              <button class="btn btn-sm btn-outline-secondary" @click="clearChatHistory()" title="清空对话">🗑</button>
+            </div>
+            <div class="chat-messages" ref="chatMessagesRef">
+              <div v-if="chatMessages.length === 0" style="color:var(--text-light);font-size:13px;text-align:center;padding:40px 16px;">
+                💬 开始与 AI 助手对话<br><small>绑定数据集后 AI 可读取数据</small>
+              </div>
+              <div v-for="(msg, idx) in chatMessages" :key="idx"
+                   class="chat-msg"
+                   :class="msg.role">
+                <div class="msg-avatar">{{ msg.role === 'user' ? 'U' : 'AI' }}</div>
+                <div class="msg-content">
+                  <div v-html="renderMarkdown(msg.content)"></div>
+                  <div style="margin-top:4px;font-size:11px;color:var(--text-light);">
+                    {{ formatDate(msg.created_at) }}
+                    <span v-if="msg.role === 'assistant'"
+                          style="cursor:pointer;margin-left:8px;color:var(--primary);"
+                          @click="saveNoteFromChat(msg)">📝 保存为笔记</span>
+                  </div>
+                </div>
+              </div>
+              <div v-if="chatLoading" class="chat-msg assistant">
+                <div class="msg-avatar">AI</div>
+                <div class="msg-content"><em>思考中...</em></div>
+              </div>
+            </div>
+            <div class="chat-input-area">
+              <textarea v-model="chatInput"
+                        @keydown="handleChatKeydown"
+                        placeholder="输入消息，Ctrl+Enter 发送..."
+                        :disabled="chatLoading"
+                        rows="2"></textarea>
+              <button class="btn-send" @click="sendChatMessage" :disabled="!chatInput.trim() || chatLoading">➤</button>
+            </div>
+          </div>
+        </div>
+
+        <!-- 笔记 Tab -->
+        <div class="tab-pane" :class="{ active: activeTab === 'notes' }">
+          <div class="notes-area" style="flex:1;overflow-y:auto;padding:12px;">
+            <div v-if="notes.length === 0" style="color:var(--text-light);font-size:13px;text-align:center;padding:40px 16px;">
+              📝 暂无笔记<br><small>在 AI 对话中可保存分析结果为笔记</small>
+            </div>
+            <div v-for="note in notes" :key="note.id" class="note-item">
+              <div class="note-title">{{ note.title }}</div>
+              <div class="note-meta">
+                <span>{{ formatDate(note.created_at) }}</span>
+                <button class="btn btn-sm btn-outline-secondary btn-sm py-0 px-1" @click="viewNote(note)" title="查看">👁</button>
+                <button class="btn btn-sm btn-outline-secondary btn-sm py-0 px-1" @click="deleteNote(note.id)" title="删除">🗑</button>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </aside>
+
+    <!-- 无空间时右侧提示 -->
+    <aside class="right-panel" v-else>
+      <div class="panel-content" style="justify-content:center;align-items:center;color:var(--text-light);font-size:13px;">
+        请选择空间后使用
+      </div>
+    </aside>
+  </div>
+
+  <!-- ==================== 模态框：上传数据集 ==================== -->
+  <div class="modal-backdrop" v-if="showUploadModal" @click.self="showUploadModal = false">
+    <div class="modal-dialog modal-lg" @click.stop>
+      <div class="modal-content">
+        <div class="modal-header">
+          <h5 class="modal-title">📤 上传 Excel 数据集</h5>
+          <button type="button" class="btn-close" @click="showUploadModal = false"></button>
+        </div>
+        <div class="modal-body">
+          <!-- 步骤指示 -->
+          <div class="upload-steps">
+            <div class="step" :class="{ active: uploadStep === 1, completed: uploadStep > 1 }">1. 选择文件</div>
+            <div class="step" :class="{ active: uploadStep === 2, completed: uploadStep > 2 }">2. 选择工作表</div>
+            <div class="step" :class="{ active: uploadStep === 3, completed: uploadStep > 3 }">3. 预览与预处理</div>
+          </div>
+
+          <!-- Step 1: 选择文件 -->
+          <div v-if="uploadStep === 1" style="text-align:center;padding:30px 0;">
+            <div style="font-size:48px;margin-bottom:16px;">📂</div>
+            <p style="color:var(--text-secondary);margin-bottom:16px;">支持 .xlsx / .xls 格式，单文件最大 50MB</p>
+            <input type="file" accept=".xlsx,.xls" @change="onUploadFileChange" class="form-control" style="max-width:400px;margin:0 auto;">
+          </div>
+
+          <!-- Step 2: 选择工作表 -->
+          <div v-if="uploadStep === 2" style="padding:20px 0;">
+            <label class="form-label">选择工作表：</label>
+            <select v-model="uploadSelectedSheet" class="form-select" v-if="uploadSheets.length > 0">
+              <option v-for="s in uploadSheets" :key="s" :value="s">{{ s }}</option>
+            </select>
+            <div v-else style="color:var(--text-light);">正在加载工作表...</div>
+            <div style="margin-top:16px;">
+              <button class="btn btn-primary" @click="confirmUploadSheet" :disabled="!uploadSelectedSheet">下一步</button>
+            </div>
+          </div>
+
+          <!-- Step 3: 预览与预处理 -->
+          <div v-if="uploadStep === 3">
+            <div style="font-size:13px;color:var(--text-secondary);margin-bottom:8px;">
+              共 {{ uploadPreviewData.total_rows || '?' }} 行 · {{ (uploadPreviewData.columns || []).length }} 列
+            </div>
+            <!-- 表格预览 -->
+            <div style="max-height:200px;overflow:auto;border:1px solid var(--border-color);border-radius:6px;margin-bottom:12px;">
+              <table class="table table-sm table-striped" style="font-size:12px;margin:0;">
+                <thead style="position:sticky;top:0;background:#f8f9fa;">
+                  <tr>
+                    <th v-for="col in uploadPreviewData.columns" :key="col">{{ col }}</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr v-for="(row, ri) in uploadPreviewData.rows" :key="ri">
+                    <td v-for="col in uploadPreviewData.columns" :key="col">{{ row[col] !== null && row[col] !== undefined ? row[col] : '' }}</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+
+            <!-- 预处理选项 -->
+            <div style="font-size:13px;font-weight:600;margin-bottom:8px;">预处理选项：</div>
+            <div class="row g-2">
+              <div class="col-md-4">
+                <label class="form-label" style="font-size:12px;">缺失值处理</label>
+                <select v-model="uploadPreprocess.missing" class="form-select form-select-sm">
+                  <option value="">不处理</option>
+                  <option value="drop">删除缺失行</option>
+                  <option value="fill_mean">均值填充</option>
+                  <option value="fill_median">中位数填充</option>
+                  <option value="fill_mode">众数填充</option>
+                  <option value="fill_zero">填充为 0</option>
+                  <option value="ffill">前向填充</option>
+                  <option value="bfill">后向填充</option>
+                </select>
+              </div>
+              <div class="col-md-4">
+                <label class="form-label" style="font-size:12px;">采样（大数据）</label>
+                <select v-model="uploadPreprocess.sampling" class="form-select form-select-sm">
+                  <option :value="null">全部数据</option>
+                  <option value="random">随机采样</option>
+                  <option value="equal">等距采样</option>
+                </select>
+              </div>
+              <div class="col-md-4">
+                <label class="form-label" style="font-size:12px;">采样数量</label>
+                <input type="number" v-model.number="uploadPreprocess.samplingN" class="form-control form-control-sm" min="100" max="1000000">
+              </div>
+              <div class="col-md-4">
+                <label class="form-label" style="font-size:12px;">日期字段转换</label>
+                <select v-model="uploadPreprocess.xType" class="form-select form-select-sm">
+                  <option value="">不转换</option>
+                  <option value="date">日期 → 数值</option>
+                </select>
+              </div>
+              <div class="col-md-4">
+                <label class="form-label" style="font-size:12px;">转换列</label>
+                <select v-model="uploadPreprocess.xCol" class="form-select form-select-sm">
+                  <option value="">请选择</option>
+                  <option v-for="col in uploadPreviewData.columns" :key="col.name" :value="col.name">{{ col.name }}</option>
+                </select>
+              </div>
+            </div>
+
+            <div style="margin-top:16px;">
+              <button class="btn btn-primary" @click="confirmUploadPreprocess" :disabled="uploadConfirming">
+                {{ uploadConfirming ? '处理中...' : '确认上传' }}
+              </button>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ==================== 模态框：新建图表 ==================== -->
+  <div class="modal-backdrop" v-if="showNewChartModal" @click.self="showNewChartModal = false">
+    <div class="modal-dialog modal-lg" @click.stop>
+      <div class="modal-content">
+        <div class="modal-header">
+          <h5 class="modal-title">📊 新建图表</h5>
+          <button type="button" class="btn-close" @click="showNewChartModal = false"></button>
+        </div>
+        <div class="modal-body">
+          <!-- 步骤指示 -->
+          <div class="chart-steps">
+            <div class="step" :class="{ active: newChartStep === 1, completed: newChartStep > 1 }">1. 选择数据集</div>
+            <div class="step" :class="{ active: newChartStep === 2, completed: newChartStep > 2 }">2. 选择图表类型</div>
+            <div class="step" :class="{ active: newChartStep === 3, completed: newChartStep > 3 }">3. 配置轴与样式</div>
+          </div>
+
+          <!-- Step 1: 选数据集 -->
+          <div v-if="newChartStep === 1" style="padding:20px 0;">
+            <label class="form-label">选择数据集：</label>
+            <select v-model="newChartForm.dataset_id" class="form-select" @change="onNewChartDatasetChange">
+              <option value="">请选择</option>
+              <option v-for="ds in datasets" :key="ds.id" :value="ds.id">{{ ds.name }}</option>
+            </select>
+            <div style="margin-top:16px;">
+              <button class="btn btn-primary" @click="newChartStep = 2" :disabled="!newChartForm.dataset_id">下一步</button>
+            </div>
+          </div>
+
+          <!-- Step 2: 选图表类型 -->
+          <div v-if="newChartStep === 2" style="padding:20px 0;">
+            <label class="form-label">选择图表类型：</label>
+            <div class="chart-type-grid">
+              <div class="chart-type-item" :class="{ active: newChartForm.chart_type === 'scatter' }" @click="newChartForm.chart_type = 'scatter'">
+                <div class="type-icon">⚬</div>
+                <div class="type-name">散点图</div>
+              </div>
+              <div class="chart-type-item" :class="{ active: newChartForm.chart_type === 'line' }" @click="newChartForm.chart_type = 'line'">
+                <div class="type-icon">📈</div>
+                <div class="type-name">折线图</div>
+              </div>
+              <div class="chart-type-item" :class="{ active: newChartForm.chart_type === 'bar' }" @click="newChartForm.chart_type = 'bar'">
+                <div class="type-icon">📊</div>
+                <div class="type-name">柱状图</div>
+              </div>
+              <div class="chart-type-item" :class="{ active: newChartForm.chart_type === 'box' }" @click="newChartForm.chart_type = 'box'">
+                <div class="type-icon">▯</div>
+                <div class="type-name">箱线图</div>
+              </div>
+              <div class="chart-type-item" :class="{ active: newChartForm.chart_type === 'area' }" @click="newChartForm.chart_type = 'area'">
+                <div class="type-icon">▬</div>
+                <div class="type-name">面积图</div>
+              </div>
+              <div class="chart-type-item" :class="{ active: newChartForm.chart_type === 'pie' }" @click="newChartForm.chart_type = 'pie'">
+                <div class="type-icon">○</div>
+                <div class="type-name">饼图</div>
+              </div>
+            </div>
+            <div style="margin-top:16px;">
+              <button class="btn btn-outline-secondary" @click="newChartStep = 1">上一步</button>
+              <button class="btn btn-primary ms-2" @click="newChartStep = 3">下一步</button>
+            </div>
+          </div>
+
+          <!-- Step 3: 配置轴 -->
+          <div v-if="newChartStep === 3" style="padding:20px 0;">
+            <div class="row g-3">
+              <div class="col-md-6">
+                <label class="form-label">图表名称</label>
+                <input v-model="newChartForm.name" class="form-control" placeholder="图表名称">
+              </div>
+              <div class="col-md-6">
+                <label class="form-label">X 轴列</label>
+                <select v-model="newChartForm.x_col" class="form-select">
+                  <option value="">请选择</option>
+                  <option v-for="col in chartDatasetColumns" :key="col.name" :value="col.name">{{ col.name }}</option>
+                </select>
+              </div>
+              <div class="col-md-6">
+                <label class="form-label">Y 轴列</label>
+                <select v-model="newChartForm.y_col" class="form-select">
+                  <option value="">请选择</option>
+                  <option v-for="col in chartDatasetColumns" :key="col.name" :value="col.name">{{ col.name }}</option>
+                </select>
+              </div>
+              <div class="col-md-6">
+                <label class="form-label">Y2 轴列（可选，饼图/箱线图可忽略）</label>
+                <select v-model="newChartForm.y2_col" class="form-select">
+                  <option value="">无</option>
+                  <option v-for="col in chartDatasetColumns" :key="col.name" :value="col.name">{{ col.name }}</option>
+                </select>
+              </div>
+              <div class="col-md-6">
+                <label class="form-label">图表标题</label>
+                <input v-model="newChartForm.config.title" class="form-control" placeholder="可选">
+              </div>
+              <div class="col-md-6">
+                <label class="form-label">X 轴标签</label>
+                <input v-model="newChartForm.config.x_label" class="form-control" placeholder="可选">
+              </div>
+              <div class="col-md-6">
+                <label class="form-label">Y 轴标签</label>
+                <input v-model="newChartForm.config.y_label" class="form-control" placeholder="可选">
+              </div>
+              <div class="col-md-6">
+                <label class="form-label">主题色</label>
+                <input v-model="newChartForm.config.color" type="color" class="form-control form-control-color">
+              </div>
+              <div class="col-12">
+                <div class="form-check">
+                  <input type="checkbox" class="form-check-input" id="trendEnabled" v-model="newChartForm.trend_enabled">
+                  <label class="form-check-label" for="trendEnabled">开启线性回归趋势分析</label>
+                </div>
+              </div>
+            </div>
+            <div style="margin-top:16px;">
+              <button class="btn btn-outline-secondary" @click="newChartStep = 2">上一步</button>
+              <button class="btn btn-primary ms-2" @click="confirmCreateChart" :disabled="!newChartForm.x_col || !newChartForm.y_col">确认创建</button>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ==================== 模态框：编辑图表 ==================== -->
+  <div class="modal-backdrop" v-if="showEditChartModal" @click.self="showEditChartModal = false">
+    <div class="modal-dialog" @click.stop>
+      <div class="modal-content">
+        <div class="modal-header">
+          <h5 class="modal-title">✏️ 编辑图表</h5>
+          <button type="button" class="btn-close" @click="showEditChartModal = false"></button>
+        </div>
+        <div class="modal-body">
+          <div class="row g-3">
+            <div class="col-md-6">
+              <label class="form-label">图表名称</label>
+              <input v-model="newChartForm.name" class="form-control">
+            </div>
+            <div class="col-md-6">
+              <label class="form-label">X 轴列</label>
+              <select v-model="newChartForm.x_col" class="form-select">
+                <option v-for="col in chartDatasetColumns" :key="col.name" :value="col.name">{{ col.name }}</option>
+              </select>
+            </div>
+            <div class="col-md-6">
+              <label class="form-label">Y 轴列</label>
+              <select v-model="newChartForm.y_col" class="form-select">
+                <option v-for="col in chartDatasetColumns" :key="col.name" :value="col.name">{{ col.name }}</option>
+              </select>
+            </div>
+            <div class="col-md-6">
+              <label class="form-label">Y2 轴列</label>
+              <select v-model="newChartForm.y2_col" class="form-select">
+                <option value="">无</option>
+                <option v-for="col in chartDatasetColumns" :key="col.name" :value="col.name">{{ col.name }}</option>
+              </select>
+            </div>
+            <div class="col-md-6">
+              <label class="form-label">图表标题</label>
+              <input v-model="newChartForm.config.title" class="form-control">
+            </div>
+            <div class="col-md-6">
+              <label class="form-label">X 轴标签</label>
+              <input v-model="newChartForm.config.x_label" class="form-control">
+            </div>
+            <div class="col-md-6">
+              <label class="form-label">Y 轴标签</label>
+              <input v-model="newChartForm.config.y_label" class="form-control">
+            </div>
+            <div class="col-md-6">
+              <label class="form-label">主题色</label>
+              <input v-model="newChartForm.config.color" type="color" class="form-control form-control-color">
+            </div>
+            <div class="col-12">
+              <div class="form-check">
+                <input type="checkbox" class="form-check-input" id="editTrendEnabled" v-model="newChartForm.trend_enabled">
+                <label class="form-check-label" for="editTrendEnabled">开启线性回归趋势分析</label>
+              </div>
+            </div>
+          </div>
+        </div>
+        <div class="modal-footer">
+          <button class="btn btn-outline-secondary" @click="showEditChartModal = false">取消</button>
+          <button class="btn btn-primary" @click="confirmEditChart">保存</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ==================== 模态框：AI 配置管理 ==================== -->
+  <div class="modal-backdrop" v-if="showAIConfigModal" @click.self="showAIConfigModal = false">
+    <div class="modal-dialog modal-lg" @click.stop>
+      <div class="modal-content">
+        <div class="modal-header">
+          <h5 class="modal-title">🤖 AI 配置管理</h5>
+          <button type="button" class="btn-close" @click="showAIConfigModal = false"></button>
+        </div>
+        <div class="modal-body">
+          <!-- 配置列表 -->
+          <div v-if="!editingAIConfigId">
+            <div v-for="cfg in aiConfigs" :key="cfg.id"
+                 style="display:flex;align-items:center;gap:8px;padding:8px 12px;border:1px solid var(--border-color);border-radius:8px;margin-bottom:8px;">
+              <div style="flex:1;min-width:0;">
+                <div style="font-weight:600;font-size:14px;">
+                  {{ cfg.name }}
+                  <span v-if="cfg.is_default" class="badge bg-primary" style="font-size:10px;">默认</span>
+                </div>
+                <div style="font-size:12px;color:var(--text-secondary);">{{ cfg.base_url }} · {{ cfg.model }}</div>
+              </div>
+              <button class="btn btn-sm btn-outline-primary" @click="editAIConfig(cfg)" title="编辑">✏️</button>
+              <button class="btn btn-sm btn-outline-secondary" @click="setDefaultAIConfig(cfg.id)" title="设为默认">⭐</button>
+              <button class="btn btn-sm btn-outline-danger" @click="deleteAIConfig(cfg.id)" title="删除">🗑</button>
+            </div>
+            <button class="btn btn-primary btn-sm mt-2" @click="resetAIConfigForm(); editingAIConfigId = -1">+ 添加配置</button>
+          </div>
+
+          <!-- 编辑/创建表单 -->
+          <div v-else>
+            <div class="row g-3">
+              <div class="col-md-6">
+                <label class="form-label">配置名称</label>
+                <input v-model="aiConfigForm.name" class="form-control" placeholder="例如：我的 OpenAI">
+              </div>
+              <div class="col-md-6">
+                <label class="form-label">API 地址</label>
+                <input v-model="aiConfigForm.base_url" class="form-control" placeholder="https://api.openai.com/v1">
+              </div>
+              <div class="col-md-6">
+                <label class="form-label">API Key</label>
+                <input v-model="aiConfigForm.api_key" type="password" class="form-control" placeholder="sk-...">
+              </div>
+              <div class="col-md-6">
+                <label class="form-label">模型名称</label>
+                <input v-model="aiConfigForm.model" class="form-control" placeholder="gpt-3.5-turbo">
+              </div>
+              <div class="col-12">
+                <label class="form-label">系统提示词</label>
+                <textarea v-model="aiConfigForm.system_prompt" class="form-control" rows="3"></textarea>
+              </div>
+              <div class="col-md-4">
+                <label class="form-label">最大 Token</label>
+                <input v-model.number="aiConfigForm.max_tokens" type="number" class="form-control" min="100" max="32000">
+              </div>
+              <div class="col-md-4">
+                <label class="form-label">温度</label>
+                <input v-model.number="aiConfigForm.temperature" type="number" step="0.1" min="0" max="2" class="form-control">
+              </div>
+              <div class="col-md-4 d-flex align-items-end">
+                <div class="form-check">
+                  <input type="checkbox" class="form-check-input" id="aiIsDefault" v-model="aiConfigForm.is_default">
+                  <label class="form-check-label" for="aiIsDefault">设为默认配置</label>
+                </div>
+              </div>
+            </div>
+            <div style="margin-top:16px;">
+              <button class="btn btn-outline-secondary" @click="cancelAIConfigEdit()">取消</button>
+              <button class="btn btn-primary ms-2" @click="saveAIConfig()">保存</button>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ==================== 模态框：备份恢复 ==================== -->
+  <div class="modal-backdrop" v-if="showBackupModal" @click.self="showBackupModal = false">
+    <div class="modal-dialog" @click.stop>
+      <div class="modal-content">
+        <div class="modal-header">
+          <h5 class="modal-title">💾 备份与恢复</h5>
+          <button type="button" class="btn-close" @click="showBackupModal = false"></button>
+        </div>
+        <div class="modal-body">
+          <div style="margin-bottom:20px;">
+            <div style="font-weight:600;margin-bottom:8px;">下载数据库备份</div>
+            <p style="font-size:13px;color:var(--text-secondary);">备份当前所有数据（空间、数据集、图表、AI配置、聊天记录）</p>
+            <button class="btn btn-primary" @click="downloadBackup()">⬇ 下载备份 (.db)</button>
+          </div>
+          <hr>
+          <div>
+            <div style="font-weight:600;margin-bottom:8px;">恢复数据库</div>
+            <p style="font-size:13px;color:var(--text-secondary);">上传之前备份的 .db 文件恢复数据（⚠ 会覆盖当前所有数据）</p>
+            <input type="file" accept=".db" @change="restoreBackup" class="form-control">
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- 前端应用 JS -->
+<script src="(( url_for('static', filename='js/app.js') ))"></script>
+</body>
+</html>

@@ -44,6 +44,13 @@ BACKUP_FOLDER = os.path.join(APP_DIR, 'backup')
 # Flask 应用初始化
 # ---------------------------------------------------------------------------
 app = Flask(__name__, template_folder=get_resource_path('templates'))
+# 修改 Jinja2 定界符，避免与 Vue.js 的 {{ }} 冲突
+app.jinja_env.variable_start_string = '(('
+app.jinja_env.variable_end_string = '))'
+app.jinja_env.block_start_string = '(%'
+app.jinja_env.block_end_string = '%)'
+app.jinja_env.comment_start_string = '(#'
+app.jinja_env.comment_end_string = '#)'
 CORS(app)
 
 app.config['SECRET_KEY'] = os.environ.get('SECRET_KEY', 'excelany-secret-key')
