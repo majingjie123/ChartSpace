@@ -1,0 +1,1276 @@
+"""
+Excel 多空间智能图表分析工具
+基于 Flask + SQLAlchemy + Vue 3 + Plotly.js
+"""
+import os
+import sys
+import uuid
+import logging
+from logging.handlers import TimedRotatingFileHandler
+from datetime import datetime, timedelta
+
+import numpy as np
+import pandas as pd
+from flask import (Flask, jsonify, request, send_file, send_from_directory,
+                   render_template)
+from flask_cors import CORS
+from sqlalchemy import (Column, Integer, String, Float, Boolean, DateTime,
+                        Text, ForeignKey, create_engine, case)
+from sqlalchemy.orm import (DeclarativeBase, Mapped, mapped_column,
+                            relationship, sessionmaker, scoped_session)
+
+# ---------------------------------------------------------------------------
+# 路径处理：兼容开发环境和 PyInstaller 打包环境
+# ---------------------------------------------------------------------------
+def get_app_dir():
+    """获取应用数据目录（exe 所在目录或项目根目录）"""
+    if getattr(sys, 'frozen', False):
+        return os.path.dirname(sys.executable)
+    return os.path.dirname(os.path.abspath(__file__))
+
+def get_resource_path(relative_path):
+    """获取资源文件路径（模板等内置资源）"""
+    if getattr(sys, '_MEIPASS', False):
+        return os.path.join(sys._MEIPASS, relative_path)
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)), relative_path)
+
+APP_DIR = get_app_dir()
+DB_PATH = os.path.join(APP_DIR, 'excelany.db')
+UPLOAD_FOLDER = os.path.join(APP_DIR, 'uploads')
+LOG_FOLDER = os.path.join(APP_DIR, 'logs')
+BACKUP_FOLDER = os.path.join(APP_DIR, 'backup')
+
+# ---------------------------------------------------------------------------
+# Flask 应用初始化
+# ---------------------------------------------------------------------------
+app = Flask(__name__, template_folder=get_resource_path('templates'))
+CORS(app)
+
+app.config['SECRET_KEY'] = os.environ.get('SECRET_KEY', 'excelany-secret-key')
+app.config['SQLALCHEMY_DATABASE_URI'] = f'sqlite:///{DB_PATH}'
+app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
+app.config['MAX_CONTENT_LENGTH'] = 50 * 1024 * 1024  # 50MB 上传限制
+app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
+
+# 确保目录存在
+os.makedirs(UPLOAD_FOLDER, exist_ok=True)
+os.makedirs(LOG_FOLDER, exist_ok=True)
+os.makedirs(BACKUP_FOLDER, exist_ok=True)
+
+# ---------------------------------------------------------------------------
+# 日志配置（按天滚动）
+# ---------------------------------------------------------------------------
+log_handler = TimedRotatingFileHandler(
+    os.path.join(LOG_FOLDER, 'error.log'),
+    when='midnight',
+    interval=1,
+    backupCount=30,
+    encoding='utf-8'
+)
+log_handler.setFormatter(logging.Formatter(
+    '%(asctime)s [%(levelname)s] %(message)s'
+))
+log_handler.setLevel(logging.ERROR)
+app.logger.addHandler(log_handler)
+app.logger.setLevel(logging.ERROR)
+
+# ---------------------------------------------------------------------------
+# 数据库引擎与会话
+# ---------------------------------------------------------------------------
+engine = create_engine(
+    app.config['SQLALCHEMY_DATABASE_URI'],
+    echo=False,
+    connect_args={'check_same_thread': False}
+)
+db_session = scoped_session(sessionmaker(bind=engine))
+
+# ---------------------------------------------------------------------------
+# SQLAlchemy ORM 基类
+# ---------------------------------------------------------------------------
+class Base(DeclarativeBase):
+    pass
+
+# ============================== 数据库模型 ===================================
+
+class Space(Base):
+    """空间/工作区"""
+    __tablename__ = 'space'
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    name = Column(String(100), nullable=False, default='新空间')
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    datasets = relationship('Dataset', back_populates='space', cascade='all, delete-orphan')
+    charts = relationship('Chart', back_populates='space', cascade='all, delete-orphan')
+    chat_histories = relationship('ChatHistory', back_populates='space', cascade='all, delete-orphan')
+    notes = relationship('AnalysisNote', back_populates='space', cascade='all, delete-orphan')
+    space_ai_configs = relationship('SpaceAIConfig', back_populates='space', cascade='all, delete-orphan')
+
+    def to_dict(self):
+        return {'id': self.id, 'name': self.name, 'created_at': self.created_at.isoformat() if self.created_at else None}
+
+
+class Dataset(Base):
+    """数据集"""
+    __tablename__ = 'dataset'
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    space_id = Column(Integer, ForeignKey('space.id', ondelete='CASCADE'), nullable=False)
+    name = Column(String(100), nullable=False)
+    file_path = Column(String(200), nullable=False)
+    selected_sheet = Column(String(100), nullable=True)
+    preprocessing_options = Column(Text, nullable=True)  # JSON
+    row_count = Column(Integer, nullable=True)
+    uploaded_at = Column(DateTime, default=datetime.utcnow)
+
+    space = relationship('Space', back_populates='datasets')
+    charts = relationship('Chart', back_populates='dataset', cascade='all, delete-orphan')
+
+    def to_dict(self):
+        return {
+            'id': self.id, 'space_id': self.space_id, 'name': self.name,
+            'file_path': self.file_path, 'selected_sheet': self.selected_sheet,
+            'preprocessing_options': self.preprocessing_options,
+            'row_count': self.row_count,
+            'uploaded_at': self.uploaded_at.isoformat() if self.uploaded_at else None
+        }
+
+
+class Chart(Base):
+    """图表"""
+    __tablename__ = 'chart'
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    space_id = Column(Integer, ForeignKey('space.id', ondelete='CASCADE'), nullable=False)
+    dataset_id = Column(Integer, ForeignKey('dataset.id', ondelete='CASCADE'), nullable=False)
+    name = Column(String(100), nullable=False)
+    chart_type = Column(String(20), default='scatter')
+    x_col = Column(String(50), nullable=True)
+    y_col = Column(String(50), nullable=True)
+    y2_col = Column(String(50), nullable=True)
+    trend_enabled = Column(Boolean, default=True)
+    config = Column(Text, nullable=True)  # JSON: { title, x_label, y_label, color }
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    space = relationship('Space', back_populates='charts')
+    dataset = relationship('Dataset', back_populates='charts')
+
+    def to_dict(self):
+        return {
+            'id': self.id, 'space_id': self.space_id, 'dataset_id': self.dataset_id,
+            'name': self.name, 'chart_type': self.chart_type,
+            'x_col': self.x_col, 'y_col': self.y_col, 'y2_col': self.y2_col,
+            'trend_enabled': bool(self.trend_enabled), 'config': self.config,
+            'created_at': self.created_at.isoformat() if self.created_at else None
+        }
+
+
+class AIConfig(Base):
+    """AI 配置"""
+    __tablename__ = 'ai_config'
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    name = Column(String(100), nullable=False)
+    base_url = Column(String(200), nullable=False)
+    api_key = Column(String(200), nullable=False)
+    model = Column(String(100), nullable=False)
+    system_prompt = Column(Text, nullable=True)
+    max_tokens = Column(Integer, default=2000)
+    temperature = Column(Float, default=0.7)
+    is_default = Column(Boolean, default=False)
+
+    space_ai_configs = relationship('SpaceAIConfig', back_populates='ai_config', cascade='all, delete-orphan')
+
+    def to_dict(self):
+        return {
+            'id': self.id, 'name': self.name, 'base_url': self.base_url,
+            'api_key': self.api_key, 'model': self.model,
+            'system_prompt': self.system_prompt, 'max_tokens': self.max_tokens,
+            'temperature': self.temperature, 'is_default': bool(self.is_default)
+        }
+
+
+class SpaceAIConfig(Base):
+    """空间 - AI 配置关联"""
+    __tablename__ = 'space_ai_config'
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    space_id = Column(Integer, ForeignKey('space.id', ondelete='CASCADE'), nullable=False)
+    ai_config_id = Column(Integer, ForeignKey('ai_config.id', ondelete='CASCADE'), nullable=False)
+    updated_at = Column(DateTime, default=datetime.utcnow)
+
+    space = relationship('Space', back_populates='space_ai_configs')
+    ai_config = relationship('AIConfig', back_populates='space_ai_configs')
+
+    def to_dict(self):
+        return {
+            'id': self.id, 'space_id': self.space_id,
+            'ai_config_id': self.ai_config_id,
+            'updated_at': self.updated_at.isoformat() if self.updated_at else None
+        }
+
+
+class ChatHistory(Base):
+    """聊天记录"""
+    __tablename__ = 'chat_history'
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    space_id = Column(Integer, ForeignKey('space.id', ondelete='CASCADE'), nullable=False)
+    role = Column(String(20), nullable=False)  # 'user' or 'assistant'
+    content = Column(Text, nullable=False)
+    dataset_id = Column(Integer, ForeignKey('dataset.id', ondelete='SET NULL'), nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    space = relationship('Space', back_populates='chat_histories')
+
+    def to_dict(self):
+        return {
+            'id': self.id, 'space_id': self.space_id, 'role': self.role,
+            'content': self.content, 'dataset_id': self.dataset_id,
+            'created_at': self.created_at.isoformat() if self.created_at else None
+        }
+
+
+class AnalysisNote(Base):
+    """分析笔记"""
+    __tablename__ = 'analysis_note'
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    space_id = Column(Integer, ForeignKey('space.id', ondelete='CASCADE'), nullable=False)
+    title = Column(String(200), nullable=True)
+    content = Column(Text, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    space = relationship('Space', back_populates='notes')
+
+    def to_dict(self):
+        return {
+            'id': self.id, 'space_id': self.space_id, 'title': self.title,
+            'content': self.content,
+            'created_at': self.created_at.isoformat() if self.created_at else None
+        }
+
+# ============================== 工具函数 =====================================
+
+class APIError(Exception):
+    """API 业务异常"""
+    def __init__(self, message, status_code=400):
+        super().__init__(message)
+        self.status_code = status_code
+
+@app.errorhandler(APIError)
+def handle_api_error(error):
+    return jsonify({'error': str(error)}), error.status_code
+
+@app.errorhandler(404)
+def not_found(error):
+    return jsonify({'error': '接口不存在'}), 404
+
+@app.errorhandler(413)
+def too_large(error):
+    return jsonify({'error': '文件过大，最大支持 50MB'}), 413
+
+@app.errorhandler(Exception)
+def handle_generic_error(error):
+    app.logger.error(f'未捕获异常: {request.path}', exc_info=True)
+    return jsonify({'error': '服务器内部错误，请查看日志'}), 500
+
+# ============================== API 路由 =====================================
+
+# -----------------------------------------------------------------------
+# 空间管理
+# -----------------------------------------------------------------------
+@app.route('/api/spaces', methods=['GET'])
+def list_spaces():
+    """获取所有空间列表"""
+    spaces = db_session.query(Space).order_by(Space.created_at.desc()).all()
+    return jsonify([s.to_dict() for s in spaces])
+
+
+@app.route('/api/spaces', methods=['POST'])
+def create_space():
+    """创建空间"""
+    data = request.get_json(silent=True) or {}
+    name = data.get('name', '新空间')
+    space = Space(name=name)
+    db_session.add(space)
+    db_session.commit()
+    return jsonify(space.to_dict()), 201
+
+
+@app.route('/api/spaces/<int:space_id>', methods=['PUT'])
+def rename_space(space_id):
+    """重命名空间"""
+    space = db_session.get(Space, space_id)
+    if not space:
+        raise APIError('空间不存在', 404)
+    data = request.get_json(silent=True) or {}
+    name = data.get('name')
+    if not name or not name.strip():
+        raise APIError('空间名称不能为空')
+    space.name = name.strip()
+    db_session.commit()
+    return jsonify(space.to_dict())
+
+
+@app.route('/api/spaces/<int:space_id>', methods=['DELETE'])
+def delete_space(space_id):
+    """删除空间（级联删除关联数据）"""
+    space = db_session.get(Space, space_id)
+    if not space:
+        raise APIError('空间不存在', 404)
+    db_session.delete(space)
+    db_session.commit()
+    return jsonify({'message': '已删除'})
+
+
+# -----------------------------------------------------------------------
+# 数据集管理
+# -----------------------------------------------------------------------
+def _get_dataframe(dataset_id):
+    """根据 dataset_id 读取 DataFrame（应用已存储的预处理选项）"""
+    ds = db_session.get(Dataset, dataset_id)
+    if not ds:
+        raise APIError('数据集不存在', 404)
+    file_ext = os.path.splitext(ds.file_path)[1].lower()
+    if file_ext not in ('.xlsx', '.xls'):
+        raise APIError('不支持的文件格式')
+    df = pd.read_excel(ds.file_path, sheet_name=ds.selected_sheet or 0, engine='openpyxl')
+    # 应用已存储的预处理选项
+    import json
+    opts = json.loads(ds.preprocessing_options) if ds.preprocessing_options else {}
+    # 缺失值处理
+    missing = opts.get('missing')
+    if missing == 'drop':
+        df = df.dropna()
+    elif missing == 'ffill':
+        df = df.ffill()
+    elif missing == 'linear':
+        df = df.interpolate(method='linear')
+    elif missing == 'mean':
+        for col in df.select_dtypes(include=[np.number]).columns:
+            df[col] = df[col].fillna(df[col].mean())
+    elif missing == 'median':
+        for col in df.select_dtypes(include=[np.number]).columns:
+            df[col] = df[col].fillna(df[col].median())
+    # 采样
+    sampling = opts.get('sampling')
+    if sampling and isinstance(sampling, dict):
+        method = sampling.get('method')
+        n = int(sampling.get('n', 50000))
+        if method == 'random' and len(df) > n:
+            df = df.sample(n=n, random_state=42)
+        elif method == 'equidistant' and len(df) > n:
+            step = len(df) // n
+            df = df.iloc[::step]
+    # 日期列转数值
+    x_type = opts.get('x_type')
+    x_col = opts.get('x_col')
+    if x_type == 'timestamp' and x_col and x_col in df.columns:
+        df[x_col + '_num'] = pd.to_datetime(df[x_col]).astype(np.int64) // 10**9
+    return df
+
+
+@app.route('/api/spaces/<int:space_id>/datasets', methods=['GET'])
+def list_datasets(space_id):
+    """获取空间内所有数据集"""
+    check_space = db_session.get(Space, space_id)
+    if not check_space:
+        raise APIError('空间不存在', 404)
+    datasets = db_session.query(Dataset).filter_by(space_id=space_id).order_by(Dataset.uploaded_at.desc()).all()
+    return jsonify([d.to_dict() for d in datasets])
+
+
+@app.route('/api/spaces/<int:space_id>/datasets', methods=['POST'])
+def upload_dataset(space_id):
+    """上传 Excel 文件（第一步：上传并解析工作表名）"""
+    check_space = db_session.get(Space, space_id)
+    if not check_space:
+        raise APIError('空间不存在', 404)
+    if 'file' not in request.files:
+        raise APIError('请上传文件')
+    file = request.files['file']
+    if file.filename == '':
+        raise APIError('请选择文件')
+    ext = os.path.splitext(file.filename)[1].lower()
+    if ext not in ('.xlsx', '.xls'):
+        raise APIError('仅支持 .xlsx 或 .xls 文件')
+    # UUID 重命名保存
+    safe_name = f"{uuid.uuid4().hex}{ext}"
+    save_path = os.path.join(UPLOAD_FOLDER, safe_name)
+    file.save(save_path)
+    # 读取工作表名
+    xls = pd.ExcelFile(save_path, engine='openpyxl')
+    sheet_names = xls.sheet_names
+    xls.close()
+    # 暂存上传记录（未确认 sheet），返回 sheets 供前端选择
+    ds = Dataset(
+        space_id=space_id,
+        name=os.path.splitext(file.filename)[0],
+        file_path=save_path,
+        selected_sheet=None,
+        row_count=None
+    )
+    db_session.add(ds)
+    db_session.commit()
+    # 尝试自动读取第一个 sheet 统计行数
+    try:
+        df_preview = pd.read_excel(save_path, sheet_name=0, engine='openpyxl', nrows=1)
+        ds.row_count = len(pd.read_excel(save_path, sheet_name=0, engine='openpyxl'))
+        db_session.commit()
+    except Exception:
+        pass
+    return jsonify({'dataset_id': ds.id, 'sheets': sheet_names, 'name': ds.name})
+
+
+@app.route('/api/datasets/<int:dataset_id>/sheets', methods=['GET'])
+def get_dataset_sheets(dataset_id):
+    """获取数据集文件的工作表名称列表"""
+    ds = db_session.get(Dataset, dataset_id)
+    if not ds:
+        raise APIError('数据集不存在', 404)
+    xls = pd.ExcelFile(ds.file_path, engine='openpyxl')
+    sheets = xls.sheet_names
+    xls.close()
+    return jsonify(sheets)
+
+
+@app.route('/api/datasets/<int:dataset_id>/confirm-sheet', methods=['POST'])
+def confirm_dataset_sheet(dataset_id):
+    """确认选择的工作表，完成数据集创建"""
+    ds = db_session.get(Dataset, dataset_id)
+    if not ds:
+        raise APIError('数据集不存在', 404)
+    data = request.get_json(silent=True) or {}
+    sheet = data.get('sheet', '')
+    if sheet:
+        ds.selected_sheet = sheet
+    # 重新统计行数
+    try:
+        df = pd.read_excel(ds.file_path, sheet_name=sheet or 0, engine='openpyxl')
+        ds.row_count = len(df)
+    except Exception:
+        ds.row_count = 0
+    db_session.commit()
+    return jsonify(ds.to_dict())
+
+
+@app.route('/api/datasets/<int:dataset_id>/preview', methods=['GET'])
+def preview_dataset(dataset_id):
+    """获取数据预览（前 N 行 + 列类型）"""
+    ds = db_session.get(Dataset, dataset_id)
+    if not ds:
+        raise APIError('数据集不存在', 404)
+    rows = request.args.get('rows', 100, type=int)
+    try:
+        df = pd.read_excel(ds.file_path, sheet_name=ds.selected_sheet or 0,
+                           engine='openpyxl', nrows=rows)
+    except Exception as e:
+        raise APIError(f'读取文件失败: {str(e)}')
+    # 识别列类型
+    col_types = {}
+    for col in df.columns:
+        col_str = str(col)
+        if pd.api.types.is_numeric_dtype(df[col]):
+            col_types[col_str] = 'numeric'
+        elif pd.api.types.is_datetime64_any_dtype(df[col]):
+            col_types[col_str] = 'datetime'
+        else:
+            col_types[col_str] = 'text'
+    # 转前端友好格式
+    preview_data = df.head(rows).to_dict(orient='records')
+    # 处理 NaN
+    for row in preview_data:
+        for k, v in row.items():
+            if pd.isna(v):
+                row[k] = None
+    return jsonify({
+        'columns': [str(c) for c in df.columns],
+        'col_types': col_types,
+        'rows': preview_data,
+        'total_rows': ds.row_count or len(df)
+    })
+
+
+@app.route('/api/datasets/<int:dataset_id>/preprocess', methods=['POST'])
+def preprocess_dataset(dataset_id):
+    """应用预处理选项并保存到数据库"""
+    ds = db_session.get(Dataset, dataset_id)
+    if not ds:
+        raise APIError('数据集不存在', 404)
+    data = request.get_json(silent=True) or {}
+    import json
+    ds.preprocessing_options = json.dumps(data, ensure_ascii=False)
+    db_session.commit()
+    # 返回预处理后的预览
+    try:
+        df = _get_dataframe(dataset_id)
+        preview_data = df.head(100).to_dict(orient='records')
+        for row in preview_data:
+            for k, v in row.items():
+                if pd.isna(v):
+                    row[k] = None
+        return jsonify({
+            'columns': [str(c) for c in df.columns],
+            'rows': preview_data,
+            'total_rows': len(df),
+            'message': '预处理已保存'
+        })
+    except Exception as e:
+        raise APIError(f'预处理失败: {str(e)}')
+
+
+@app.route('/api/datasets/<int:dataset_id>', methods=['DELETE'])
+def delete_dataset(dataset_id):
+    """删除数据集（同时删除关联图表）"""
+    ds = db_session.get(Dataset, dataset_id)
+    if not ds:
+        raise APIError('数据集不存在', 404)
+    # 删除关联图表
+    db_session.query(Chart).filter_by(dataset_id=dataset_id).delete()
+    # 删除文件
+    try:
+        if os.path.exists(ds.file_path):
+            os.remove(ds.file_path)
+    except Exception:
+        pass
+    db_session.delete(ds)
+    db_session.commit()
+    return jsonify({'message': '已删除'})
+
+
+# -----------------------------------------------------------------------
+# 趋势分析模块（一元线性回归 + 预测）
+# -----------------------------------------------------------------------
+from collections import namedtuple
+
+TrendResult = namedtuple('TrendResult', ['slope', 'intercept', 'r2', 'direction',
+                                         'x_pred', 'y_pred', 'x_fit', 'y_fit',
+                                         'x_orig', 'y_orig'])
+
+def trend_analysis(x, y):
+    """对 x, y 进行一元线性回归分析，返回 TrendResult"""
+    import numpy as np
+    from sklearn.linear_model import LinearRegression
+    from sklearn.metrics import r2_score
+
+    x = np.array(x, dtype=float)
+    y = np.array(y, dtype=float)
+
+    # 清理 NaN / Inf
+    mask = ~(np.isnan(x) | np.isnan(y) | np.isinf(x) | np.isinf(y))
+    x = x[mask]
+    y = y[mask]
+    if len(x) < 3:
+        return TrendResult(0, 0, 0, '平稳', [], [], [], [], x.tolist(), y.tolist())
+
+    model = LinearRegression()
+    model.fit(x.reshape(-1, 1), y)
+    slope = float(model.coef_[0])
+    intercept = float(model.intercept_)
+    y_pred = model.predict(x.reshape(-1, 1))
+    r2 = float(r2_score(y, y_pred))
+
+    # 趋势方向
+    if slope > 0.01:
+        direction = '上升'
+    elif slope < -0.01:
+        direction = '下降'
+    else:
+        direction = '平稳'
+
+    # 基于最后一步长外推未来 3 期
+    if len(x) >= 2:
+        step = (x[-1] - x[0]) / max(len(x) - 1, 1)
+    else:
+        step = 1
+    x_pred = [x[-1] + step * (i + 1) for i in range(3)]
+    y_pred_future = [float(model.predict([[xv]])[0]) for xv in x_pred]
+    x_fit = x.tolist()
+    y_fit = y_pred.tolist()
+
+    return TrendResult(slope, intercept, r2, direction,
+                       x_pred, y_pred_future, x_fit, y_fit,
+                       x.tolist(), y.tolist())
+
+
+def _build_plotly_json(df, chart, trend_result=None):
+    """根据图表配置构建 Plotly 图形 JSON"""
+    import plotly.graph_objects as go
+    import json
+
+    chart_config = json.loads(chart.config) if chart.config else {}
+    title = chart_config.get('title', chart.name)
+    x_label = chart_config.get('x_label', chart.x_col or '')
+    y_label = chart_config.get('y_label', chart.y_col or '')
+    color_theme = chart_config.get('color', '#1f77b4')
+    chart_type = chart.chart_type or 'scatter'
+
+    x_col = chart.x_col
+    y_col = chart.y_col
+    y2_col = chart.y2_col
+
+    # 获取数据
+    if x_col and x_col in df.columns and y_col and y_col in df.columns:
+        x_data = df[x_col].dropna()
+        y_data = df[y_col].dropna()
+        # 对齐
+        common = x_data.index.intersection(y_data.index)
+        x_vals = x_data.loc[common].tolist()
+        y_vals = y_data.loc[common].tolist()
+    else:
+        x_vals, y_vals = [], []
+
+    fig = go.Figure()
+
+    use_gl = len(x_vals) > 5000 and chart_type in ('scatter', 'line')
+
+    # 主 trace
+    if chart_type == 'scatter':
+        trace_type = 'scattergl' if use_gl else 'scatter'
+        fig.add_trace(go.Scattergl(
+            x=x_vals, y=y_vals, mode='markers',
+            name=chart.name, marker=dict(color=color_theme, size=6)
+        ) if use_gl else go.Scatter(
+            x=x_vals, y=y_vals, mode='markers',
+            name=chart.name, marker=dict(color=color_theme, size=6)
+        ))
+    elif chart_type == 'line':
+        trace_type = 'scattergl' if use_gl else 'scatter'
+        fig.add_trace(go.Scattergl(
+            x=x_vals, y=y_vals, mode='lines+markers',
+            name=chart.name, marker=dict(color=color_theme),
+            line=dict(color=color_theme)
+        ) if use_gl else go.Scatter(
+            x=x_vals, y=y_vals, mode='lines+markers',
+            name=chart.name, marker=dict(color=color_theme),
+            line=dict(color=color_theme)
+        ))
+    elif chart_type == 'bar':
+        fig.add_trace(go.Bar(x=x_vals, y=y_vals, name=chart.name,
+                             marker_color=color_theme))
+    elif chart_type == 'area':
+        fig.add_trace(go.Scatter(x=x_vals, y=y_vals, mode='lines',
+                                 fill='tozeroy', name=chart.name,
+                                 line=dict(color=color_theme)))
+    elif chart_type == 'box':
+        if y2_col and y2_col in df.columns:
+            fig.add_trace(go.Box(y=df[y_col].dropna(), name=y_col,
+                                 marker_color=color_theme))
+            fig.add_trace(go.Box(y=df[y2_col].dropna(), name=y2_col,
+                                 marker_color=color_theme))
+        else:
+            fig.add_trace(go.Box(y=y_vals, name=chart.name,
+                                 marker_color=color_theme))
+    elif chart_type == 'pie':
+        if y2_col and y2_col in df.columns:
+            labels = df[y2_col].dropna().unique()[:20]
+            values = df.groupby(y2_col)[y_col].sum().values[:20]
+        else:
+            # 使用 X 列前 20 个值作为标签
+            labels = x_vals[:20] if x_vals else []
+            values = y_vals[:20] if y_vals else []
+        fig.add_trace(go.Pie(labels=labels, values=values, name=chart.name))
+
+    # 趋势线（散点/折线/柱状图）
+    if trend_result and chart.trend_enabled and chart_type in ('scatter', 'line', 'bar'):
+        # 拟合线
+        fig.add_trace(go.Scatter(
+            x=trend_result.x_fit, y=trend_result.y_fit,
+            mode='lines', name='趋势线',
+            line=dict(color='red', dash='dash', width=2)
+        ))
+        # 预测点
+        fig.add_trace(go.Scatter(
+            x=trend_result.x_pred, y=trend_result.y_pred,
+            mode='markers', name='预测值',
+            marker=dict(color='green', symbol='star', size=12)
+        ))
+
+    fig.update_layout(
+        title=title,
+        xaxis_title=x_label,
+        yaxis_title=y_label,
+        template='plotly_white',
+        hovermode='closest',
+        margin=dict(l=40, r=20, t=40, b=40),
+        height=400
+    )
+    return fig
+
+
+# -----------------------------------------------------------------------
+# 图表管理
+# -----------------------------------------------------------------------
+@app.route('/api/spaces/<int:space_id>/charts', methods=['GET'])
+def list_charts(space_id):
+    """获取空间内所有图表"""
+    check_space = db_session.get(Space, space_id)
+    if not check_space:
+        raise APIError('空间不存在', 404)
+    charts = db_session.query(Chart).filter_by(space_id=space_id).order_by(Chart.created_at.desc()).all()
+    return jsonify([c.to_dict() for c in charts])
+
+
+@app.route('/api/spaces/<int:space_id>/charts', methods=['POST'])
+def create_chart(space_id):
+    """创建图表"""
+    check_space = db_session.get(Space, space_id)
+    if not check_space:
+        raise APIError('空间不存在', 404)
+    data = request.get_json(silent=True) or {}
+    required = ['dataset_id', 'name', 'chart_type', 'x_col', 'y_col']
+    for field in required:
+        if field not in data:
+            raise APIError(f'缺少必填字段: {field}')
+    import json
+    chart = Chart(
+        space_id=space_id,
+        dataset_id=data['dataset_id'],
+        name=data['name'],
+        chart_type=data.get('chart_type', 'scatter'),
+        x_col=data.get('x_col', ''),
+        y_col=data.get('y_col', ''),
+        y2_col=data.get('y2_col', ''),
+        trend_enabled=data.get('trend_enabled', True),
+        config=json.dumps(data.get('config', {}), ensure_ascii=False)
+    )
+    db_session.add(chart)
+    db_session.commit()
+    return jsonify(chart.to_dict()), 201
+
+
+@app.route('/api/charts/<int:chart_id>', methods=['PUT'])
+def update_chart(chart_id):
+    """更新图表"""
+    chart = db_session.get(Chart, chart_id)
+    if not chart:
+        raise APIError('图表不存在', 404)
+    data = request.get_json(silent=True) or {}
+    import json
+    if 'name' in data:
+        chart.name = data['name']
+    if 'chart_type' in data:
+        chart.chart_type = data['chart_type']
+    if 'x_col' in data:
+        chart.x_col = data['x_col']
+    if 'y_col' in data:
+        chart.y_col = data['y_col']
+    if 'y2_col' in data:
+        chart.y2_col = data['y2_col']
+    if 'trend_enabled' in data:
+        chart.trend_enabled = data['trend_enabled']
+    if 'config' in data:
+        chart.config = json.dumps(data['config'], ensure_ascii=False)
+    db_session.commit()
+    return jsonify(chart.to_dict())
+
+
+@app.route('/api/charts/<int:chart_id>', methods=['DELETE'])
+def delete_chart(chart_id):
+    """删除图表"""
+    chart = db_session.get(Chart, chart_id)
+    if not chart:
+        raise APIError('图表不存在', 404)
+    db_session.delete(chart)
+    db_session.commit()
+    return jsonify({'message': '已删除'})
+
+
+@app.route('/api/charts/<int:chart_id>/render', methods=['GET'])
+def render_chart(chart_id):
+    """渲染图表（返回 Plotly HTML + 趋势分析信息）"""
+    chart = db_session.get(Chart, chart_id)
+    if not chart:
+        raise APIError('图表不存在', 404)
+    try:
+        df = _get_dataframe(chart.dataset_id)
+    except Exception as e:
+        raise APIError(f'读取数据失败: {str(e)}')
+
+    trend_result = None
+    trend_info = None
+    if chart.trend_enabled and chart.chart_type in ('scatter', 'line', 'bar'):
+        x_col = chart.x_col
+        y_col = chart.y_col
+        if x_col and y_col and x_col in df.columns and y_col in df.columns:
+            x_data = df[x_col].dropna()
+            y_data = df[y_col].dropna()
+            common = x_data.index.intersection(y_data.index)
+            x_vals = x_data.loc[common].tolist()
+            y_vals = y_data.loc[common].tolist()
+            if len(x_vals) >= 3:
+                trend_result = trend_analysis(x_vals, y_vals)
+                trend_info = {
+                    'slope': round(trend_result.slope, 4),
+                    'intercept': round(trend_result.intercept, 4),
+                    'r2': round(trend_result.r2, 4),
+                    'direction': trend_result.direction,
+                    'predictions': [
+                        {'period': i+1, 'x': round(trend_result.x_pred[i], 4),
+                         'y_pred': round(trend_result.y_pred[i], 4)}
+                        for i in range(3)
+                    ],
+                    'data_points': [
+                        {'x': trend_result.x_orig[i], 'y': trend_result.y_orig[i],
+                         'y_fit': trend_result.y_fit[i]}
+                        for i in range(len(trend_result.x_orig))
+                    ]
+                }
+
+    fig = _build_plotly_json(df, chart, trend_result)
+    chart_html = fig.to_html(full_html=False, include_plotlyjs='cdn', div_id=f'chart-{chart_id}')
+
+    return jsonify({
+        'chart_html': chart_html,
+        'chart_data': chart.to_dict(),
+        'trend_info': trend_info
+    })
+
+
+@app.route('/api/charts/<int:chart_id>/export-csv', methods=['GET'])
+def export_chart_csv(chart_id):
+    """导出图表趋势分析 CSV"""
+    chart = db_session.get(Chart, chart_id)
+    if not chart:
+        raise APIError('图表不存在', 404)
+    try:
+        df = _get_dataframe(chart.dataset_id)
+    except Exception as e:
+        raise APIError(f'读取数据失败: {str(e)}')
+    x_col, y_col = chart.x_col, chart.y_col
+    if not x_col or not y_col or x_col not in df.columns or y_col not in df.columns:
+        raise APIError('列不存在')
+    x_data = df[x_col].dropna()
+    y_data = df[y_col].dropna()
+    common = x_data.index.intersection(y_data.index)
+    x_vals = x_data.loc[common].tolist()
+    y_vals = y_data.loc[common].tolist()
+
+    if len(x_vals) >= 3:
+        tr = trend_analysis(x_vals, y_vals)
+        out_df = pd.DataFrame({
+            'X': tr.x_orig,
+            'Y': tr.y_orig,
+            'Y_fit': tr.y_fit
+        })
+        # 追加预测行
+        pred_df = pd.DataFrame({
+            'X': tr.x_pred,
+            'Y': ['']*3,
+            'Y_fit': tr.y_pred
+        })
+        out_df = pd.concat([out_df, pred_df], ignore_index=True)
+    else:
+        out_df = pd.DataFrame({'X': x_vals, 'Y': y_vals, 'Y_fit': ['']*len(x_vals)})
+
+    csv_path = os.path.join(UPLOAD_FOLDER, f'chart_{chart_id}_trend.csv')
+    out_df.to_csv(csv_path, index=False, encoding='utf-8-sig')
+    return send_file(csv_path, mimetype='text/csv',
+                     as_attachment=True,
+                     download_name=f'{chart.name}_趋势分析.csv')
+
+
+@app.route('/api/charts/<int:chart_id>/export-image', methods=['POST'])
+def export_chart_image(chart_id):
+    """导出图表为 PNG（使用 Plotly 的 kaleido 引擎）"""
+    chart = db_session.get(Chart, chart_id)
+    if not chart:
+        raise APIError('图表不存在', 404)
+    try:
+        df = _get_dataframe(chart.dataset_id)
+    except Exception as e:
+        raise APIError(f'读取数据失败: {str(e)}')
+
+    trend_result = None
+    if chart.trend_enabled and chart.chart_type in ('scatter', 'line', 'bar'):
+        x_col, y_col = chart.x_col, chart.y_col
+        if x_col and y_col and x_col in df.columns and y_col in df.columns:
+            x_data = df[x_col].dropna()
+            y_data = df[y_col].dropna()
+            common = x_data.index.intersection(y_data.index)
+            x_vals = x_data.loc[common].tolist()
+            y_vals = y_data.loc[common].tolist()
+            if len(x_vals) >= 3:
+                trend_result = trend_analysis(x_vals, y_vals)
+
+    fig = _build_plotly_json(df, chart, trend_result)
+    img_path = os.path.join(UPLOAD_FOLDER, f'chart_{chart_id}.png')
+    fig.write_image(img_path, format='png', width=900, height=500, scale=2)
+    return send_file(img_path, mimetype='image/png',
+                     as_attachment=True,
+                     download_name=f'{chart.name}.png')
+
+
+# -----------------------------------------------------------------------
+# AI 配置管理
+# -----------------------------------------------------------------------
+@app.route('/api/ai-configs', methods=['GET'])
+def list_ai_configs():
+    """获取所有 AI 配置"""
+    configs = db_session.query(AIConfig).all()
+    return jsonify([c.to_dict() for c in configs])
+
+
+@app.route('/api/ai-configs', methods=['POST'])
+def create_ai_config():
+    """新增 AI 配置"""
+    data = request.get_json(silent=True) or {}
+    required = ['name', 'base_url', 'api_key', 'model']
+    for field in required:
+        if not data.get(field):
+            raise APIError(f'缺少必填字段: {field}')
+    config = AIConfig(
+        name=data['name'],
+        base_url=data['base_url'].rstrip('/'),
+        api_key=data['api_key'],
+        model=data['model'],
+        system_prompt=data.get('system_prompt', '你是一个数据分析助手，基于用户上传的 Excel 数据回答问题。'),
+        max_tokens=data.get('max_tokens', 2000),
+        temperature=data.get('temperature', 0.7),
+        is_default=data.get('is_default', False)
+    )
+    if config.is_default:
+        db_session.query(AIConfig).filter(AIConfig.is_default == True).update({'is_default': False})
+    db_session.add(config)
+    db_session.commit()
+    return jsonify(config.to_dict()), 201
+
+
+@app.route('/api/ai-configs/<int:config_id>', methods=['PUT'])
+def update_ai_config(config_id):
+    """更新 AI 配置"""
+    config = db_session.get(AIConfig, config_id)
+    if not config:
+        raise APIError('AI 配置不存在', 404)
+    data = request.get_json(silent=True) or {}
+    for field in ['name', 'base_url', 'api_key', 'model', 'system_prompt',
+                  'max_tokens', 'temperature', 'is_default']:
+        if field in data:
+            setattr(config, field, data[field])
+    if data.get('is_default'):
+        db_session.query(AIConfig).filter(AIConfig.is_default == True, AIConfig.id != config_id).update({'is_default': False})
+    db_session.commit()
+    return jsonify(config.to_dict())
+
+
+@app.route('/api/ai-configs/<int:config_id>', methods=['DELETE'])
+def delete_ai_config(config_id):
+    """删除 AI 配置"""
+    config = db_session.get(AIConfig, config_id)
+    if not config:
+        raise APIError('AI 配置不存在', 404)
+    db_session.delete(config)
+    db_session.commit()
+    return jsonify({'message': '已删除'})
+
+
+@app.route('/api/ai-configs/<int:config_id>/set-default', methods=['POST'])
+def set_default_ai_config(config_id):
+    """设置默认 AI 配置"""
+    config = db_session.get(AIConfig, config_id)
+    if not config:
+        raise APIError('AI 配置不存在', 404)
+    db_session.query(AIConfig).filter(AIConfig.is_default == True).update({'is_default': False})
+    config.is_default = True
+    db_session.commit()
+    return jsonify(config.to_dict())
+
+
+# -----------------------------------------------------------------------
+# 空间 AI 绑定
+# -----------------------------------------------------------------------
+@app.route('/api/spaces/<int:space_id>/ai-config', methods=['GET'])
+def get_space_ai_config(space_id):
+    """获取空间绑定的 AI 配置 ID"""
+    check_space = db_session.get(Space, space_id)
+    if not check_space:
+        raise APIError('空间不存在', 404)
+    binding = db_session.query(SpaceAIConfig).filter_by(space_id=space_id).first()
+    if binding:
+        return jsonify({'ai_config_id': binding.ai_config_id})
+    # 返回默认配置
+    default = db_session.query(AIConfig).filter_by(is_default=True).first()
+    return jsonify({'ai_config_id': default.id if default else None})
+
+
+@app.route('/api/spaces/<int:space_id>/ai-config', methods=['POST'])
+def set_space_ai_config(space_id):
+    """设置空间绑定的 AI 配置"""
+    check_space = db_session.get(Space, space_id)
+    if not check_space:
+        raise APIError('空间不存在', 404)
+    data = request.get_json(silent=True) or {}
+    ai_config_id = data.get('ai_config_id')
+    if not ai_config_id:
+        raise APIError('请指定 AI 配置')
+    ai_config = db_session.get(AIConfig, ai_config_id)
+    if not ai_config:
+        raise APIError('AI 配置不存在')
+    # 删除旧绑定
+    db_session.query(SpaceAIConfig).filter_by(space_id=space_id).delete()
+    binding = SpaceAIConfig(space_id=space_id, ai_config_id=ai_config_id)
+    db_session.add(binding)
+    db_session.commit()
+    return jsonify(binding.to_dict())
+
+
+# -----------------------------------------------------------------------
+# AI 聊天
+# -----------------------------------------------------------------------
+@app.route('/api/chat', methods=['POST'])
+def chat():
+    """发送消息给 AI（含数据集上下文）"""
+    data = request.get_json(silent=True) or {}
+    space_id = data.get('space_id')
+    if not space_id:
+        raise APIError('缺少 space_id')
+    message = data.get('message', '').strip()
+    if not message:
+        raise APIError('消息不能为空')
+    dataset_id = data.get('dataset_id')
+
+    # 获取空间绑定的 AI 配置
+    binding = db_session.query(SpaceAIConfig).filter_by(space_id=space_id).first()
+    config = None
+    if binding:
+        config = db_session.get(AIConfig, binding.ai_config_id)
+    if not config:
+        config = db_session.query(AIConfig).filter_by(is_default=True).first()
+    if not config:
+        raise APIError('未配置 AI，请先在 AI 配置管理中添加配置并与空间绑定')
+
+    # 存储用户消息
+    user_msg = ChatHistory(space_id=space_id, role='user', content=message, dataset_id=dataset_id)
+    db_session.add(user_msg)
+    db_session.commit()
+
+    # 构建 system prompt
+    system_prompt = config.system_prompt or '你是一个数据分析助手。'
+    if dataset_id:
+        try:
+            ds = db_session.get(Dataset, dataset_id)
+            if ds:
+                df = _get_dataframe(dataset_id)
+                col_info = ', '.join([f'{c}({str(df[c].dtype)})' for c in df.columns])
+                preview = df.head(10).to_string()
+                desc = df.describe().to_string() if len(df.select_dtypes(include=[np.number]).columns) > 0 else '无数值列'
+                data_context = (
+                    f'\n\n## 当前数据集: {ds.name}\n'
+                    f'- 列信息: {col_info}\n'
+                    f'- 行数: {len(df)}\n'
+                    f'- 前 10 行数据:\n{preview}\n'
+                    f'- 描述性统计:\n{desc}\n'
+                )
+                system_prompt += data_context
+        except Exception as e:
+            app.logger.error(f'读取数据集失败: {str(e)}')
+
+    # 构建消息列表
+    messages = [{'role': 'system', 'content': system_prompt}]
+    recent_history = db_session.query(ChatHistory).filter_by(space_id=space_id)\
+        .order_by(ChatHistory.created_at.desc()).limit(20).all()
+    recent_history.reverse()
+    for h in recent_history:
+        messages.append({'role': h.role, 'content': h.content})
+    # 确保最后一条是 user 消息
+    if not messages or messages[-1]['role'] != 'user':
+        messages.append({'role': 'user', 'content': message})
+
+    # 调用 AI API
+    import requests as http_requests
+    try:
+        resp = http_requests.post(
+            f"{config.base_url}/chat/completions",
+            headers={
+                'Authorization': f'Bearer {config.api_key}',
+                'Content-Type': 'application/json'
+            },
+            json={
+                'model': config.model,
+                'messages': messages,
+                'max_tokens': config.max_tokens or 2000,
+                'temperature': config.temperature or 0.7
+            },
+            timeout=60
+        )
+        if resp.status_code != 200:
+            raise APIError(f'AI 接口返回错误: {resp.status_code} - {resp.text[:200]}')
+        reply = resp.json()['choices'][0]['message']['content']
+    except Exception as e:
+        if isinstance(e, APIError):
+            raise
+        raise APIError(f'调用 AI 接口失败: {str(e)}')
+
+    # 存储 AI 回复
+    ai_msg = ChatHistory(space_id=space_id, role='assistant', content=reply, dataset_id=dataset_id)
+    db_session.add(ai_msg)
+    db_session.commit()
+
+    return jsonify({'reply': reply, 'message_id': ai_msg.id})
+
+
+@app.route('/api/spaces/<int:space_id>/chat-history', methods=['GET'])
+def get_chat_history(space_id):
+    """获取空间聊天记录"""
+    check_space = db_session.get(Space, space_id)
+    if not check_space:
+        raise APIError('空间不存在', 404)
+    history = db_session.query(ChatHistory).filter_by(space_id=space_id)\
+        .order_by(ChatHistory.created_at.asc()).all()
+    return jsonify([h.to_dict() for h in history])
+
+
+@app.route('/api/spaces/<int:space_id>/chat-history', methods=['DELETE'])
+def clear_chat_history(space_id):
+    """清空空间聊天记录"""
+    check_space = db_session.get(Space, space_id)
+    if not check_space:
+        raise APIError('空间不存在', 404)
+    db_session.query(ChatHistory).filter_by(space_id=space_id).delete()
+    db_session.commit()
+    return jsonify({'message': '已清空'})
+
+
+# -----------------------------------------------------------------------
+# 分析笔记
+# -----------------------------------------------------------------------
+@app.route('/api/notes', methods=['POST'])
+def create_note():
+    """保存分析笔记"""
+    data = request.get_json(silent=True) or {}
+    space_id = data.get('space_id')
+    if not space_id:
+        raise APIError('缺少 space_id')
+    note = AnalysisNote(
+        space_id=space_id,
+        title=data.get('title', '分析笔记'),
+        content=data.get('content', '')
+    )
+    db_session.add(note)
+    db_session.commit()
+    return jsonify(note.to_dict()), 201
+
+
+@app.route('/api/spaces/<int:space_id>/notes', methods=['GET'])
+def list_notes(space_id):
+    """获取空间笔记列表"""
+    check_space = db_session.get(Space, space_id)
+    if not check_space:
+        raise APIError('空间不存在', 404)
+    notes = db_session.query(AnalysisNote).filter_by(space_id=space_id)\
+        .order_by(AnalysisNote.created_at.desc()).all()
+    return jsonify([n.to_dict() for n in notes])
+
+
+@app.route('/api/notes/<int:note_id>', methods=['DELETE'])
+def delete_note(note_id):
+    """删除分析笔记"""
+    note = db_session.get(AnalysisNote, note_id)
+    if not note:
+        raise APIError('笔记不存在', 404)
+    db_session.delete(note)
+    db_session.commit()
+    return jsonify({'message': '已删除'})
+
+
+# -----------------------------------------------------------------------
+# 导出与备份
+# -----------------------------------------------------------------------
+@app.route('/api/spaces/<int:space_id>/export', methods=['GET'])
+def export_space(space_id):
+    """导出整个空间为 ZIP 包"""
+    import zipfile
+    import json as json_module
+    from io import BytesIO
+
+    space = db_session.get(Space, space_id)
+    if not space:
+        raise APIError('空间不存在', 404)
+
+    buf = BytesIO()
+    with zipfile.ZipFile(buf, 'w', zipfile.ZIP_DEFLATED) as zf:
+        # 数据集文件
+        datasets = db_session.query(Dataset).filter_by(space_id=space_id).all()
+        for ds in datasets:
+            if os.path.exists(ds.file_path):
+                arc_name = f'datasets/{ds.name}_{ds.id}{os.path.splitext(ds.file_path)[1]}'
+                zf.write(ds.file_path, arc_name)
+        # 图表 HTML 快照
+        charts = db_session.query(Chart).filter_by(space_id=space_id).all()
+        for chart in charts:
+            try:
+                url = f"http://127.0.0.1:{os.environ.get('PORT', 5000)}/api/charts/{chart.id}/render"
+                import requests as http_requests
+                resp = http_requests.get(url, timeout=10)
+                if resp.status_code == 200:
+                    zf.writestr(f'charts/{chart.name}_{chart.id}.json',
+                                json_module.dumps(resp.json(), ensure_ascii=False, indent=2))
+            except Exception:
+                pass
+        # 聊天记录
+        history = db_session.query(ChatHistory).filter_by(space_id=space_id)\
+            .order_by(ChatHistory.created_at.asc()).all()
+        zf.writestr('chat_history.json',
+                    json_module.dumps([h.to_dict() for h in history],
+                                      ensure_ascii=False, indent=2,
+                                      default=str))
+        # 分析笔记
+        notes = db_session.query(AnalysisNote).filter_by(space_id=space_id).all()
+        zf.writestr('analysis_notes.json',
+                    json_module.dumps([n.to_dict() for n in notes],
+                                      ensure_ascii=False, indent=2,
+                                      default=str))
+    buf.seek(0)
+    return send_file(buf, mimetype='application/zip',
+                     as_attachment=True,
+                     download_name=f'{space.name}_导出.zip')
+
+
+@app.route('/api/system/backup', methods=['GET'])
+def backup_database():
+    """下载数据库备份"""
+    if not os.path.exists(DB_PATH):
+        raise APIError('数据库文件不存在')
+    return send_file(DB_PATH, mimetype='application/octet-stream',
+                     as_attachment=True,
+                     download_name=f'excelany_backup_{datetime.now().strftime("%Y%m%d_%H%M%S")}.db')
+
+
+@app.route('/api/system/restore', methods=['POST'])
+def restore_database():
+    """上传备份文件恢复数据库"""
+    if 'file' not in request.files:
+        raise APIError('请上传备份文件')
+    file = request.files['file']
+    if file.filename == '':
+        raise APIError('请选择文件')
+    ext = os.path.splitext(file.filename)[1].lower()
+    if ext != '.db':
+        raise APIError('请上传 .db 文件')
+    # 备份当前数据库
+    backup_path = os.path.join(BACKUP_FOLDER, f'pre_restore_{datetime.now().strftime("%Y%m%d_%H%M%S")}.db')
+    if os.path.exists(DB_PATH):
+        import shutil
+        shutil.copy2(DB_PATH, backup_path)
+    # 关闭当前连接并覆盖
+    db_session.remove()
+    file.save(DB_PATH)
+    # 重新初始化
+    init_db()
+    return jsonify({'message': '数据库已恢复，原数据库已备份到 backup 目录'})
+
+
+@app.route('/')
+def index():
+    """返回前端 SPA 页面"""
+    return render_template('index.html')
+
+# ============================== 启动入口 =====================================
+
+def init_db():
+    """初始化数据库，创建所有表"""
+    Base.metadata.create_all(bind=engine)
+
+def main():
+    init_db()
+    port = int(os.environ.get('PORT', 5000))
+    debug = not getattr(sys, 'frozen', False)
+    app.logger.info(f'服务启动: http://127.0.0.1:{port}')
+    app.run(host='0.0.0.0', port=port, debug=debug, use_reloader=False)
+
+if __name__ == '__main__':
+    main()
