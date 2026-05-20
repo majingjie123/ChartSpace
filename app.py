@@ -266,6 +266,12 @@ def handle_api_error(error):
 def not_found(error):
     return jsonify({'error': '接口不存在'}), 404
 
+@app.errorhandler(405)
+def method_not_allowed(error):
+    valid = getattr(error, 'valid_methods', None)
+    msg = f'请求方法不允许。支持的请求方法: {", ".join(valid) if valid else "N/A"}'
+    return jsonify({'error': msg}), 405
+
 @app.errorhandler(413)
 def too_large(error):
     return jsonify({'error': '文件过大，最大支持 50MB'}), 413
@@ -800,12 +806,17 @@ def render_chart(chart_id):
             x_vals = x_data.loc[common].tolist()
             y_vals = y_data.loc[common].tolist()
             if len(x_vals) >= 3:
-                trend_result = trend_analysis(x_vals, y_vals)
-                trend_info = {
-                    'slope': round(trend_result.slope, 4),
-                    'intercept': round(trend_result.intercept, 4),
-                    'r2': round(trend_result.r2, 4),
-                    'direction': trend_result.direction,
+                try:
+                    trend_result = trend_analysis(x_vals, y_vals)
+                except Exception:
+                    app.logger.warning(f'趋势分析失败: x_col={x_col}, y_col={y_col}')
+                    trend_result = None
+                if trend_result:
+                    trend_info = {
+                        'slope': round(trend_result.slope, 4),
+                        'intercept': round(trend_result.intercept, 4),
+                        'r2': round(trend_result.r2, 4),
+                        'direction': trend_result.direction,
                     'predictions': [
                         {'period': i+1, 'x': round(trend_result.x_pred[i], 4),
                          'y_pred': round(trend_result.y_pred[i], 4)}
@@ -848,19 +859,26 @@ def export_chart_csv(chart_id):
     y_vals = y_data.loc[common].tolist()
 
     if len(x_vals) >= 3:
-        tr = trend_analysis(x_vals, y_vals)
-        out_df = pd.DataFrame({
-            'X': tr.x_orig,
-            'Y': tr.y_orig,
-            'Y_fit': tr.y_fit
-        })
-        # 追加预测行
-        pred_df = pd.DataFrame({
-            'X': tr.x_pred,
-            'Y': ['']*3,
-            'Y_fit': tr.y_pred
-        })
-        out_df = pd.concat([out_df, pred_df], ignore_index=True)
+        try:
+            tr = trend_analysis(x_vals, y_vals)
+        except Exception:
+            app.logger.warning(f'导出 CSV 趋势分析失败: x_col={x_col}, y_col={y_col}')
+            tr = None
+        if tr:
+            out_df = pd.DataFrame({
+                'X': tr.x_orig,
+                'Y': tr.y_orig,
+                'Y_fit': tr.y_fit
+            })
+            # 追加预测行
+            pred_df = pd.DataFrame({
+                'X': tr.x_pred,
+                'Y': ['']*3,
+                'Y_fit': tr.y_pred
+            })
+            out_df = pd.concat([out_df, pred_df], ignore_index=True)
+        else:
+            out_df = pd.DataFrame({'X': x_vals, 'Y': y_vals, 'Y_fit': ['']*len(x_vals)})
     else:
         out_df = pd.DataFrame({'X': x_vals, 'Y': y_vals, 'Y_fit': ['']*len(x_vals)})
 
@@ -892,7 +910,11 @@ def export_chart_image(chart_id):
             x_vals = x_data.loc[common].tolist()
             y_vals = y_data.loc[common].tolist()
             if len(x_vals) >= 3:
-                trend_result = trend_analysis(x_vals, y_vals)
+                try:
+                    trend_result = trend_analysis(x_vals, y_vals)
+                except Exception:
+                    app.logger.warning(f'导出图片趋势分析失败: x_col={x_col}, y_col={y_col}')
+                    trend_result = None
 
     fig = _build_plotly_json(df, chart, trend_result)
     img_path = os.path.join(UPLOAD_FOLDER, f'chart_{chart_id}.png')
