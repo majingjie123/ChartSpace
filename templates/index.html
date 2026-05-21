@@ -627,7 +627,7 @@
               <button class="btn btn-sm btn-outline-secondary" @click="setDefaultAIConfig(cfg.id)" title="设为默认">⭐</button>
               <button class="btn btn-sm btn-outline-danger" @click="deleteAIConfig(cfg.id)" title="删除">🗑</button>
             </div>
-            <button class="btn btn-primary btn-sm mt-2" @click="resetAIConfigForm(); editingAIConfigId = -1">+ 添加配置</button>
+            <button class="btn btn-primary btn-sm mt-2" @click="resetAIConfigForm(); editingAIConfigId = null">+ 添加配置</button>
           </div>
 
           <!-- 编辑/创建表单 -->
