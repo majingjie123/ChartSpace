@@ -79,6 +79,7 @@ const app = createApp({
       // ---- AI 模型刷新 ----
       refreshingModels: false,
       cachedModelList: [],
+      showModelsDropdown: false,
 
       // ---- 空间重命名 ----
       renamingSpace: false,
@@ -88,7 +89,19 @@ const app = createApp({
       toasts: [],
 
       // ---- 加载状态 ----
-      loading: { spaces: false, datasets: false, charts: false, chat: false, notes: false }
+      loading: { spaces: false, datasets: false, charts: false, chat: false, notes: false },
+
+      // ---- 认证 ----
+      authRequired: false,
+      authenticated: false,
+      loginPassword: '',
+
+      // ---- 内存监控 ----
+      sysMem: null,
+      memTimer: null,
+      
+      // ---- 数据量级消息 ----
+      uploadVolMsg: ''
     };
   },
 
@@ -147,6 +160,42 @@ const app = createApp({
         this.toast(msg, 'error');
         throw err;
       }
+    },
+
+    async loadMemory() {
+      try {
+        this.sysMem = await this.api('GET', '/system/memory');
+      } catch (e) {}
+    },
+
+    async checkAuthStatus() {
+      try {
+        const res = await this.api('GET', '/auth/status');
+        this.authRequired = res.required;
+        this.authenticated = res.authenticated;
+        if (this.authRequired && !this.authenticated) {
+          // 停止其他加载直到认证
+          return;
+        }
+        this.initApp();
+      } catch (e) {}
+    },
+
+    async login() {
+      try {
+        await this.api('POST', '/auth/login', { password: this.loginPassword });
+        this.authenticated = true;
+        this.toast('登录成功');
+        this.initApp();
+      } catch (e) {}
+    },
+
+    initApp() {
+      this.loadSpaces();
+      this.loadAIConfigs();
+      this.loadMemory();
+      if (this.memTimer) clearInterval(this.memTimer);
+      this.memTimer = setInterval(() => this.loadMemory(), 10000);
     },
 
     // ======================== 空间管理 ========================
@@ -244,10 +293,9 @@ const app = createApp({
       if (!file) return;
       // 检查文件大小
       const sizeMB = file.size / (1024 * 1024);
-      if (sizeMB > 100) {
-        this.uploadWarnLarge = '100';
-      } else {
-        this.uploadWarnLarge = null;
+      if (sizeMB > 50) {
+        this.toast('文件超过 50MB 限制', 'error');
+        return;
       }
       this.uploadFile = file;
       this.uploadStep = 1;
@@ -256,9 +304,16 @@ const app = createApp({
       formData.append('file', file);
       try {
         const result = await this.api('POST', `/spaces/${this.currentSpaceId}/datasets`, formData, true);
-        this.uploadDatasetId = result.id;
+        this.uploadDatasetId = result.dataset_id;
         this.uploadSheets = result.sheets || [];
         this.uploadSelectedSheet = result.sheets?.[0] || '';
+        this.uploadVolMsg = result.vol_msg || '';
+        if (result.vol_level === 'million') {
+          alert('⚠️ 百万行级超大文件提醒：\n' + result.vol_msg);
+          this.uploadPreprocess.sampling = 'random';
+        } else if (result.vol_level === 'hundred_thousand') {
+          this.toast(result.vol_msg, 'warning');
+        }
         this.uploadStep = 2;
       } catch (e) {
         // error handled by api()
@@ -269,8 +324,18 @@ const app = createApp({
       if (!this.uploadSelectedSheet && this.uploadSheets.length > 0) {
         this.uploadSelectedSheet = this.uploadSheets[0];
       }
-      this.uploadStep = 3;
-      await this.loadUploadPreview();
+      try {
+        const result = await this.api('POST', `/datasets/${this.uploadDatasetId}/confirm-sheet`, {
+          sheet: this.uploadSelectedSheet
+        });
+        this.uploadVolMsg = result.vol_msg || '';
+        if (result.vol_level === 'million') {
+          alert('⚠️ 百万行级超大文件提醒：\n' + result.vol_msg);
+          this.uploadPreprocess.sampling = 'random';
+        }
+        this.uploadStep = 3;
+        await this.loadUploadPreview();
+      } catch (e) { /* handled */ }
     },
 
     async loadUploadPreview() {
@@ -467,13 +532,9 @@ const app = createApp({
       window.open(`/api/charts/${chart.id}/export-csv`, '_blank');
     },
 
-    async exportChartImage(chart) {
-      try {
-        await this.api('POST', `/charts/${chart.id}/export-image`);
-        // The API returns a file, we need to download it
-        window.open(`/api/charts/${chart.id}/export-image`, '_blank');
-        this.toast('图片已导出');
-      } catch (e) { /* handled */ }
+    exportChartImage(chart) {
+      window.open(`/api/charts/${chart.id}/export-image`, '_blank');
+      this.toast('图片导出中，请稍候...');
     },
 
     // ======================== AI 配置 ========================
@@ -552,13 +613,24 @@ const app = createApp({
     },
 
     async refreshAIModels() {
-      if (!this.editingAIConfigId) {
-        this.toast('请先保存 AI 配置再刷新模型', 'warning');
-        return;
-      }
       this.refreshingModels = true;
       try {
-        const result = await this.api('POST', `/ai-configs/${this.editingAIConfigId}/refresh-models`);
+        let result;
+        const f = this.aiConfigForm;
+        if (this.editingAIConfigId) {
+          // 已有保存的配置 → 用已有记录刷新
+          result = await this.api('POST', `/ai-configs/${this.editingAIConfigId}/refresh-models`);
+        } else {
+          // 新建模式 → 用表单值预览刷新
+          if (!f.base_url || !f.api_key) {
+            this.toast('请先填写 base_url 和 api_key', 'warning');
+            return;
+          }
+          result = await this.api('POST', '/ai-configs/refresh-models-preview', {
+            base_url: f.base_url,
+            api_key: f.api_key
+          });
+        }
         this.cachedModelList = result.models || [];
         this.toast(result.message || '模型列表已刷新');
         if (this.cachedModelList.length > 0) {
@@ -600,7 +672,8 @@ const app = createApp({
     },
 
     handleChatKeydown(e) {
-      if (e.ctrlKey && e.key === 'Enter') {
+      if (e.key === 'Enter' && !e.shiftKey) {
+        e.preventDefault();
         this.sendChatMessage();
       }
     },
@@ -610,8 +683,17 @@ const app = createApp({
       this.loading.chat = true;
       try {
         this.chatMessages = await this.api('GET', `/spaces/${this.currentSpaceId}/chat-history`);
+        await this.$nextTick();
+        this.scrollChatToBottom();
       } finally {
         this.loading.chat = false;
+      }
+    },
+
+    scrollChatToBottom() {
+      const container = this.$refs.chatMessagesRef;
+      if (container) {
+        container.scrollTop = container.scrollHeight;
       }
     },
 
@@ -750,8 +832,7 @@ const app = createApp({
   },
 
   mounted() {
-    this.loadSpaces();
-    this.loadAIConfigs();
+    this.checkAuthStatus();
   }
 });
 

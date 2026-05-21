@@ -17,6 +17,16 @@
 </head>
 <body>
 <div id="app">
+  <!-- ==================== 登录遮罩 ==================== -->
+  <div class="login-overlay" v-if="authRequired && !authenticated">
+    <div class="login-card">
+      <h3>🔐 访问受限</h3>
+      <p>请输入启动密码以继续</p>
+      <input type="password" v-model="loginPassword" @keyup.enter="login" class="form-control mb-3" placeholder="密码">
+      <button class="btn btn-primary w-100" @click="login">进入系统</button>
+    </div>
+  </div>
+
   <!-- ==================== Toast 通知 ==================== -->
   <div class="toast-container">
     <div v-for="t in toasts" :key="t.id"
@@ -61,6 +71,15 @@
 
       <!-- 底部按钮 -->
       <div class="sidebar-footer">
+        <div v-if="sysMem" class="mem-status mb-2" :class="{ warning: sysMem.warning }">
+          <div class="d-flex justify-content-between">
+            <span>内存占用</span>
+            <span>{{ sysMem.sys_percent }}%</span>
+          </div>
+          <div class="progress" style="height: 4px;margin-top:4px;">
+            <div class="progress-bar" :style="{ width: sysMem.sys_percent + '%', backgroundColor: sysMem.warning ? '#ff4d4f' : '#52c41a' }"></div>
+          </div>
+        </div>
         <button class="btn-sidebar" @click="showAIConfigModal = true; resetAIConfigForm()">🤖 AI 配置</button>
         <button class="btn-sidebar" @click="openBackupModal()">💾 备份恢复</button>
         <button class="btn-sidebar" @click="showExitConfirm = true" title="退出程序">🚪 退出</button>
@@ -240,7 +259,7 @@
             <div class="chat-input-area">
               <textarea v-model="chatInput"
                         @keydown="handleChatKeydown"
-                        placeholder="输入消息，Ctrl+Enter 发送..."
+                        placeholder="输入消息，Enter 发送..."
                         :disabled="chatLoading"
                         rows="2"></textarea>
               <button class="btn-send" @click="sendChatMessage" :disabled="!chatInput.trim() || chatLoading">➤</button>
@@ -303,6 +322,9 @@
 
           <!-- Step 2: 选择工作表 -->
           <div v-if="uploadStep === 2" style="padding:20px 0;">
+            <div v-if="uploadVolMsg" class="alert alert-info py-2 px-3 mb-3" style="font-size:13px;">
+              ℹ️ {{ uploadVolMsg }}
+            </div>
             <label class="form-label">选择工作表：</label>
             <select v-model="uploadSelectedSheet" class="form-select" v-if="uploadSheets.length > 0">
               <option v-for="s in uploadSheets" :key="s" :value="s">{{ s }}</option>
@@ -315,6 +337,9 @@
 
           <!-- Step 3: 预览与预处理 -->
           <div v-if="uploadStep === 3">
+            <div v-if="uploadVolMsg" class="alert alert-info py-2 px-3 mb-2" style="font-size:13px;">
+              ℹ️ {{ uploadVolMsg }}
+            </div>
             <div style="font-size:13px;color:var(--text-secondary);margin-bottom:8px;">
               共 {{ uploadPreviewData.total_rows || '?' }} 行 · {{ (uploadPreviewData.columns || []).length }} 列
             </div>
@@ -623,13 +648,19 @@
               <div class="col-md-6">
                 <label class="form-label">模型名称</label>
                 <div class="input-group">
-                  <input v-model="aiConfigForm.model" class="form-control" placeholder="例: gpt-3.5-turbo" list="modelSuggestions">
+                  <input v-model="aiConfigForm.model" class="form-control" placeholder="例: gpt-3.5-turbo" list="modelSuggestions" @focus="showModelsDropdown = true" @blur="setTimeout(function(){showModelsDropdown=false;},200)">
                   <button class="btn btn-outline-secondary" type="button" @click="refreshAIModels()" :disabled="refreshingModels" title="从 API 刷新可用模型列表">
                     <span v-if="refreshingModels">⟳</span><span v-else>🔄</span>
                   </button>
                   <datalist id="modelSuggestions">
                     <option v-for="m in cachedModelList" :key="m" :value="m">{{ m }}</option>
                   </datalist>
+                </div>
+                <div class="model-list" v-if="cachedModelList.length > 0 && showModelsDropdown">
+                  <span class="model-list-label">可用模型（点击选择）：</span>
+                  <span class="model-tag" v-for="m in cachedModelList" :key="m"
+                        :class="{ active: aiConfigForm.model === m }"
+                        @mousedown.prevent="aiConfigForm.model = m; showModelsDropdown = false">{{ m }}</span>
                 </div>
               </div>
               <div class="col-12">

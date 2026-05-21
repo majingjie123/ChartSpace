@@ -13,11 +13,13 @@ from datetime import datetime, timedelta
 import numpy as np
 import pandas as pd
 import threading
+import psutil
+import argparse
 from flask import (Flask, jsonify, request, send_file, send_from_directory,
-                   render_template)
+                   render_template, session)
 from flask_cors import CORS
 from sqlalchemy import (Column, Integer, String, Float, Boolean, DateTime,
-                        Text, ForeignKey, create_engine, case)
+                        Text, ForeignKey, create_engine, case, inspect, text)
 from sqlalchemy.orm import (DeclarativeBase, Mapped, mapped_column,
                             relationship, sessionmaker, scoped_session)
 
@@ -67,6 +69,69 @@ app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 os.makedirs(LOG_FOLDER, exist_ok=True)
 os.makedirs(BACKUP_FOLDER, exist_ok=True)
+
+# ---------------------------------------------------------------------------
+# 全局安全配置
+# ---------------------------------------------------------------------------
+ACCESS_PASSWORD = None
+
+@app.before_request
+def check_auth():
+    """可选启动密码校验"""
+    if ACCESS_PASSWORD is None:
+        return
+    # 允许访问登录接口和静态资源
+    if request.path in ['/api/auth/login', '/api/auth/status'] or \
+       request.path.startswith('/static/') or \
+       request.path == '/':
+        return
+    if not session.get('is_authenticated'):
+        return jsonify({'error': '未授权访问', 'code': 401}), 401
+
+@app.route('/api/auth/status', methods=['GET'])
+def auth_status():
+    return jsonify({
+        'required': ACCESS_PASSWORD is not None,
+        'authenticated': session.get('is_authenticated', False)
+    })
+
+@app.route('/api/auth/login', methods=['POST'])
+def auth_login():
+    data = request.get_json(silent=True) or {}
+    pwd = data.get('password')
+    if ACCESS_PASSWORD and pwd == ACCESS_PASSWORD:
+        session['is_authenticated'] = True
+        return jsonify({'message': '登录成功'})
+    return jsonify({'error': '密码错误'}), 401
+
+# ---------------------------------------------------------------------------
+# 内存监控工具
+# ---------------------------------------------------------------------------
+def get_memory_info():
+    """获取当前进程内存占用及系统内存状态"""
+    process = psutil.Process(os.getpid())
+    mem_info = process.memory_info()
+    sys_mem = psutil.virtual_memory()
+    return {
+        'process_mb': round(mem_info.rss / (1024 * 1024), 2),
+        'sys_percent': sys_mem.percent,
+        'sys_available_mb': round(sys_mem.available / (1024 * 1024), 2),
+        'warning': sys_mem.percent > 85
+    }
+
+def categorize_data_volume(row_count):
+    """数据量级判定"""
+    if row_count >= 1000000:
+        return "million", f"该文件包含 {row_count} 行数据，属于百万行级及以上海量表格。加载、渲染、运算耗时较长，建议开启采样以保证流畅度。"
+    elif row_count >= 100000:
+        return "hundred_thousand", f"该文件包含 {row_count} 行数据，属于十万行级大文件，加载预计耗时较长。"
+    elif row_count >= 10000:
+        return "ten_thousand", f"该文件包含 {row_count} 行数据，属于万行级数据，加载较快。"
+    return "small", f"该文件包含 {row_count} 行数据，属于常规量级。"
+
+@app.route('/api/system/memory', methods=['GET'])
+def system_memory():
+    return jsonify(get_memory_info())
 
 # ---------------------------------------------------------------------------
 # 日志配置（按天滚动）
@@ -401,6 +466,29 @@ def list_datasets(space_id):
     return jsonify([d.to_dict() for d in datasets])
 
 
+def get_row_count(file_path, sheet_name=None):
+    """高效获取 Excel 行数（不加载全部数据到内存）"""
+    import openpyxl
+    try:
+        wb = openpyxl.load_workbook(file_path, read_only=True, keep_links=False)
+        if sheet_name:
+            if sheet_name in wb.sheetnames:
+                ws = wb[sheet_name]
+            else:
+                ws = wb.active
+        else:
+            ws = wb.active
+        count = ws.max_row
+        wb.close()
+        return count
+    except Exception:
+        # 备选方案：使用 pandas 但限制列以减少内存
+        try:
+            df = pd.read_excel(file_path, sheet_name=sheet_name or 0, usecols=[0], engine='openpyxl')
+            return len(df)
+        except Exception:
+            return 0
+
 @app.route('/api/spaces/<int:space_id>/datasets', methods=['POST'])
 def upload_dataset(space_id):
     """上传 Excel 文件（第一步：上传并解析工作表名）"""
@@ -433,14 +521,19 @@ def upload_dataset(space_id):
     )
     db_session.add(ds)
     db_session.commit()
-    # 尝试自动读取第一个 sheet 统计行数
-    try:
-        df_preview = pd.read_excel(save_path, sheet_name=0, engine='openpyxl', nrows=1)
-        ds.row_count = len(pd.read_excel(save_path, sheet_name=0, engine='openpyxl'))
-        db_session.commit()
-    except Exception:
-        pass
-    return jsonify({'dataset_id': ds.id, 'sheets': sheet_names, 'name': ds.name})
+    
+    # 尝试高效统计行数
+    ds.row_count = get_row_count(save_path)
+    db_session.commit()
+    vol_level, vol_msg = categorize_data_volume(ds.row_count)
+    
+    return jsonify({
+        'dataset_id': ds.id, 
+        'sheets': sheet_names, 
+        'name': ds.name,
+        'vol_level': vol_level,
+        'vol_msg': vol_msg
+    })
 
 
 @app.route('/api/datasets/<int:dataset_id>/sheets', methods=['GET'])
@@ -465,14 +558,13 @@ def confirm_dataset_sheet(dataset_id):
     sheet = data.get('sheet', '')
     if sheet:
         ds.selected_sheet = sheet
-    # 重新统计行数
-    try:
-        df = pd.read_excel(ds.file_path, sheet_name=sheet or 0, engine='openpyxl')
-        ds.row_count = len(df)
-    except Exception:
-        ds.row_count = 0
+    # 高效统计行数
+    ds.row_count = get_row_count(ds.file_path, sheet)
+    vol_level, vol_msg = categorize_data_volume(ds.row_count or 0)
     db_session.commit()
-    return jsonify(ds.to_dict())
+    res = ds.to_dict()
+    res.update({'vol_level': vol_level, 'vol_msg': vol_msg})
+    return jsonify(res)
 
 
 @app.route('/api/datasets/<int:dataset_id>/preview', methods=['GET'])
@@ -925,7 +1017,7 @@ def export_chart_csv(chart_id):
                      download_name=f'{chart.name}_趋势分析.csv')
 
 
-@app.route('/api/charts/<int:chart_id>/export-image', methods=['POST'])
+@app.route('/api/charts/<int:chart_id>/export-image', methods=['GET', 'POST'])
 def export_chart_image(chart_id):
     """导出图表为 PNG（使用 Plotly 的 kaleido 引擎）"""
     chart = db_session.get(Chart, chart_id)
@@ -1041,29 +1133,63 @@ def refresh_ai_models(config_id):
     if not config:
         raise APIError('AI 配置不存在', 404)
     import requests as http_requests
-    try:
-        resp = http_requests.get(
-            f"{config.base_url}/models",
-            headers={'Authorization': f'Bearer {config.api_key}'},
-            timeout=15
-        )
-        if resp.status_code != 200:
-            raise APIError(f'获取模型列表失败: {resp.status_code}')
-        data = resp.json()
-        models = []
-        if 'data' in data:
-            for m in data['data']:
-                if isinstance(m, dict) and 'id' in m:
-                    models.append(m['id'])
-                elif isinstance(m, str):
-                    models.append(m)
-        config.cached_models = json.dumps(models, ensure_ascii=False)
-        db_session.commit()
-        return jsonify({'models': models, 'message': f'已刷新，获取到 {len(models)} 个模型'})
-    except APIError:
-        raise
-    except Exception as e:
-        raise APIError(f'刷新模型列表失败: {str(e)}')
+    models, _ = _fetch_models_from_url(config.base_url, config.api_key)
+    if not models:
+        raise APIError(f'获取模型列表失败，请检查 base_url 和 api_key 是否正确')
+    config.cached_models = json.dumps(models, ensure_ascii=False)
+    db_session.commit()
+    return jsonify({'models': models, 'message': f'已刷新，获取到 {len(models)} 个模型'})
+
+
+@app.route('/api/ai-configs/refresh-models-preview', methods=['POST'])
+def refresh_ai_models_preview():
+    """预览刷新模型（无需保存配置，直接使用表单传参）"""
+    data = request.get_json(silent=True) or {}
+    base_url = (data.get('base_url') or '').strip()
+    api_key = (data.get('api_key') or '').strip()
+    if not base_url or not api_key:
+        raise APIError('base_url 和 api_key 不能为空')
+    import requests as http_requests
+    models, last_error = _fetch_models_from_url(base_url, api_key)
+    if not models:
+        raise APIError(f'获取模型列表失败: {last_error or "未知错误"}')
+    return jsonify({'models': models, 'message': f'获取到 {len(models)} 个模型'})
+
+
+def _fetch_models_from_url(base_url, api_key):
+    """从 API 地址拉取模型列表，返回 (models_list, last_error_str)"""
+    import requests as http_requests
+    base = base_url.rstrip('/')
+    candidates = []
+    if '/v1' not in base:
+        candidates.append(f"{base}/v1/models")
+    candidates.append(f"{base}/models")
+    last_error = ''
+    for url in candidates:
+        try:
+            resp = http_requests.get(
+                url,
+                headers={'Authorization': f'Bearer {api_key}'},
+                timeout=15
+            )
+            if resp.status_code == 200:
+                data = resp.json()
+                models = []
+                if 'data' in data:
+                    for m in data['data']:
+                        if isinstance(m, dict) and 'id' in m:
+                            models.append(m['id'])
+                        elif isinstance(m, str):
+                            models.append(m)
+                if models:
+                    return models, ''
+                last_error = '返回数据中没有模型'
+            else:
+                last_error = f'HTTP {resp.status_code}'
+        except requests.exceptions.RequestException as ex:
+            last_error = str(ex)
+            continue
+    return [], last_error
 
 
 # -----------------------------------------------------------------------
@@ -1372,12 +1498,35 @@ def index():
 # ============================== 启动入口 =====================================
 
 def init_db():
-    """初始化数据库，创建所有表"""
+    """初始化数据库，创建所有表，并同步缺失的列"""
     Base.metadata.create_all(bind=engine)
+    
+    # 简单的数据库迁移逻辑：检查并添加缺失的列
+    inspector = inspect(engine)
+    
+    # 检查 ai_config 表
+    if 'ai_config' in inspector.get_table_names():
+        columns = [c['name'] for c in inspector.get_columns('ai_config')]
+        if 'cached_models' not in columns:
+            app.logger.info("正在同步数据库：为 ai_config 表添加 cached_models 列")
+            try:
+                with engine.connect() as conn:
+                    conn.execute(text("ALTER TABLE ai_config ADD COLUMN cached_models TEXT DEFAULT '[]'"))
+                    conn.commit()
+            except Exception as e:
+                app.logger.error(f"同步 ai_config 表失败: {e}")
 
 def main():
+    parser = argparse.ArgumentParser(description='ExcelAny Backend Server')
+    parser.add_argument('--port', type=int, default=5000, help='服务运行端口')
+    parser.add_argument('--password', type=str, help='访问密码')
+    args = parser.parse_args()
+
+    global ACCESS_PASSWORD
+    ACCESS_PASSWORD = args.password
+
     init_db()
-    port = int(os.environ.get('PORT', 5000))
+    port = args.port
     debug = not getattr(sys, 'frozen', False)
     
     # 注册信号处理，支持优雅退出
@@ -1400,6 +1549,9 @@ def main():
         threading.Thread(target=open_browser, daemon=True).start()
         
     app.logger.info(f'服务启动: http://127.0.0.1:{port}')
+    if ACCESS_PASSWORD:
+        app.logger.info('已开启启动密码验证')
+    
     app.run(host='127.0.0.1', port=port, debug=debug, use_reloader=False)
 
 if __name__ == '__main__':

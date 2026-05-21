@@ -499,7 +499,7 @@ body {
 }
 
 /* 模态框 */
-.modal-content { border: none; border-radius: 12px; box-shadow: var(--shadow-lg); }
+.modal-content { border: none; border-radius: 12px; box-shadow: var(--shadow-lg); background: var(--bg-card); }
 .modal-header {
   border-bottom: 1px solid var(--border-color);
   padding: 16px 20px;
@@ -642,7 +642,38 @@ body {
 /* 数据集选择下拉突出 */
 .ai-dataset-select { font-size: 12px; }
 
-/* Markdown 样式 */
+/* --- 登录遮罩 --- */
+.login-overlay {
+  position: fixed;
+  inset: 0;
+  background: var(--bg-main);
+  z-index: 10000;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+.login-card {
+  background: #fff;
+  padding: 30px;
+  border-radius: 12px;
+  box-shadow: var(--shadow-lg);
+  width: 100%;
+  max-width: 360px;
+  text-align: center;
+}
+.login-card h3 { font-weight: 600; margin-bottom: 8px; }
+.login-card p { color: var(--text-secondary); margin-bottom: 24px; font-size: 14px; }
+
+/* --- 内存状态 --- */
+.mem-status {
+  padding: 8px 12px;
+  background: rgba(255,255,255,0.05);
+  border-radius: 8px;
+  font-size: 11px;
+}
+.mem-status.warning { background: rgba(255,77,79,0.1); }
+.mem-status .progress { background: rgba(255,255,255,0.1); }
+.mem-status.warning .progress { background: rgba(255,77,79,0.2); }
 .msg-content h1, .msg-content h2, .msg-content h3, .msg-content h4 {
   font-size: 14px;
   margin-top: 8px;
@@ -667,4 +698,45 @@ body {
   padding-left: 10px;
   margin: 6px 0;
   color: var(--text-secondary);
+}
+
+/* 模型列表下拉 */
+.model-list {
+  margin-top: 6px;
+  padding: 8px 10px;
+  background: var(--bg-card);
+  border: 1px solid var(--border-color);
+  border-radius: 8px;
+  max-height: 160px;
+  overflow-y: auto;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  align-items: center;
+}
+.model-list-label {
+  font-size: 12px;
+  color: var(--text-secondary);
+  width: 100%;
+  margin-bottom: 4px;
+}
+.model-tag {
+  display: inline-block;
+  padding: 3px 10px;
+  font-size: 12px;
+  border-radius: 4px;
+  background: var(--primary-light);
+  color: var(--primary);
+  cursor: pointer;
+  border: 1px solid transparent;
+  transition: var(--transition);
+}
+.model-tag:hover {
+  border-color: var(--primary);
+  background: #dce2fd;
+}
+.model-tag.active {
+  background: var(--primary);
+  color: #fff;
+  border-color: var(--primary);
 }
