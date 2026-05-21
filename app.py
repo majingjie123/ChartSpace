@@ -5,6 +5,7 @@ Excel 多空间智能图表分析工具
 import os
 import sys
 import uuid
+import json
 import logging
 from logging.handlers import TimedRotatingFileHandler
 from datetime import datetime, timedelta
@@ -183,6 +184,7 @@ class AIConfig(Base):
     max_tokens = Column(Integer, default=2000)
     temperature = Column(Float, default=0.7)
     is_default = Column(Boolean, default=False)
+    cached_models = Column(Text, nullable=True, default='[]')
 
     space_ai_configs = relationship('SpaceAIConfig', back_populates='ai_config', cascade='all, delete-orphan')
 
@@ -191,7 +193,8 @@ class AIConfig(Base):
             'id': self.id, 'name': self.name, 'base_url': self.base_url,
             'api_key': self.api_key, 'model': self.model,
             'system_prompt': self.system_prompt, 'max_tokens': self.max_tokens,
-            'temperature': self.temperature, 'is_default': bool(self.is_default)
+            'temperature': self.temperature, 'is_default': bool(self.is_default),
+            'cached_models': json.loads(self.cached_models) if self.cached_models else []
         }
 
 
@@ -345,7 +348,13 @@ def _get_dataframe(dataset_id):
     file_ext = os.path.splitext(ds.file_path)[1].lower()
     if file_ext not in ('.xlsx', '.xls'):
         raise APIError('不支持的文件格式')
-    df = pd.read_excel(ds.file_path, sheet_name=ds.selected_sheet or 0, engine='openpyxl')
+    # 超大文件分块读取（>100MB 仅读取前 50000 行）
+    file_size_mb = _get_file_size_mb(ds.file_path)
+    if file_size_mb > 100:
+        app.logger.info(f'大文件({file_size_mb:.0f}MB)采用分块读取策略')
+        df = pd.read_excel(ds.file_path, sheet_name=ds.selected_sheet or 0, engine='openpyxl', nrows=50000)
+    else:
+        df = pd.read_excel(ds.file_path, sheet_name=ds.selected_sheet or 0, engine='openpyxl')
     # 应用已存储的预处理选项
     import json
     opts = json.loads(ds.preprocessing_options) if ds.preprocessing_options else {}
@@ -547,6 +556,28 @@ def delete_dataset(dataset_id):
     db_session.delete(ds)
     db_session.commit()
     return jsonify({'message': '已删除'})
+
+
+def _get_file_size_mb(filepath):
+    try:
+        return os.path.getsize(filepath) / (1024 * 1024)
+    except Exception:
+        return 0
+
+
+@app.route('/api/datasets/<int:dataset_id>/info', methods=['GET'])
+def get_dataset_info(dataset_id):
+    ds = db_session.get(Dataset, dataset_id)
+    if not ds:
+        raise APIError('数据集不存在', 404)
+    size_mb = _get_file_size_mb(ds.file_path) if ds.file_path else 0
+    return jsonify({
+        'id': ds.id,
+        'name': ds.name,
+        'file_size_mb': round(size_mb, 2),
+        'row_count': ds.row_count or 0,
+        'column_count': ds.column_count or 0
+    })
 
 
 # -----------------------------------------------------------------------
@@ -1003,6 +1034,37 @@ def set_default_ai_config(config_id):
     return jsonify(config.to_dict())
 
 
+@app.route('/api/ai-configs/<int:config_id>/refresh-models', methods=['POST'])
+def refresh_ai_models(config_id):
+    config = db_session.get(AIConfig, config_id)
+    if not config:
+        raise APIError('AI 配置不存在', 404)
+    import requests as http_requests
+    try:
+        resp = http_requests.get(
+            f"{config.base_url}/models",
+            headers={'Authorization': f'Bearer {config.api_key}'},
+            timeout=15
+        )
+        if resp.status_code != 200:
+            raise APIError(f'获取模型列表失败: {resp.status_code}')
+        data = resp.json()
+        models = []
+        if 'data' in data:
+            for m in data['data']:
+                if isinstance(m, dict) and 'id' in m:
+                    models.append(m['id'])
+                elif isinstance(m, str):
+                    models.append(m)
+        config.cached_models = json.dumps(models, ensure_ascii=False)
+        db_session.commit()
+        return jsonify({'models': models, 'message': f'已刷新，获取到 {len(models)} 个模型'})
+    except APIError:
+        raise
+    except Exception as e:
+        raise APIError(f'刷新模型列表失败: {str(e)}')
+
+
 # -----------------------------------------------------------------------
 # 空间 AI 绑定
 # -----------------------------------------------------------------------
@@ -1287,6 +1349,20 @@ def restore_database():
     return jsonify({'message': '数据库已恢复，原数据库已备份到 backup 目录'})
 
 
+@app.route('/api/system/shutdown', methods=['POST'])
+def shutdown_server():
+    import signal
+    app.logger.info('收到退出指令，正在关闭服务...')
+    # 使用线程延迟执行，确保 HTTP 响应能返回
+    def delayed_shutdown():
+        import time
+        time.sleep(0.5)
+        # 发送信号让主线程退出
+        os.kill(os.getpid(), signal.SIGTERM)
+    threading.Thread(target=delayed_shutdown, daemon=True).start()
+    return jsonify({'message': '服务正在关闭...'})
+
+
 @app.route('/')
 def index():
     """返回前端 SPA 页面"""
@@ -1302,6 +1378,14 @@ def main():
     init_db()
     port = int(os.environ.get('PORT', 5000))
     debug = not getattr(sys, 'frozen', False)
+    
+    # 注册信号处理，支持优雅退出
+    import signal
+    def handle_exit(signum, frame):
+        app.logger.info(f'收到信号 {signum}，正在退出...')
+        sys.exit(0)
+    signal.signal(signal.SIGTERM, handle_exit)
+    signal.signal(signal.SIGINT, handle_exit)
     
     # 打包环境自动打开浏览器
     if not debug:

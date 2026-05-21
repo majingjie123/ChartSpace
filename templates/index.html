@@ -61,8 +61,9 @@
 
       <!-- 底部按钮 -->
       <div class="sidebar-footer">
-        <button class="btn-sidebar" @click="showAIConfigModal = true; resetAIConfigForm();">🤖 AI 配置</button>
+        <button class="btn-sidebar" @click="showAIConfigModal = true; resetAIConfigForm()">🤖 AI 配置</button>
         <button class="btn-sidebar" @click="openBackupModal()">💾 备份恢复</button>
+        <button class="btn-sidebar" @click="showExitConfirm = true" title="退出程序">🚪 退出</button>
       </div>
     </aside>
 
@@ -293,8 +294,11 @@
           <!-- Step 1: 选择文件 -->
           <div v-if="uploadStep === 1" style="text-align:center;padding:30px 0;">
             <div style="font-size:48px;margin-bottom:16px;">📂</div>
-            <p style="color:var(--text-secondary);margin-bottom:16px;">支持 .xlsx / .xls 格式，单文件最大 50MB</p>
-            <input type="file" accept=".xlsx,.xls" @change="onUploadFileChange" class="form-control" style="max-width:400px;margin:0 auto;">
+            <p style="color:var(--text-secondary);margin-bottom:16px;">支持 .xlsx / .xls 格式</p>
+            <div v-if="uploadWarnLarge" class="alert alert-warning" style="font-size:13px;margin-bottom:12px;">
+              ⚠️ 文件超过 {{ uploadWarnLarge }}MB，系统将自动采样前 50000 行数据，<br>可在后续步骤中调整采样策略。
+            </div>
+            <input type="file" accept=".xlsx,.xls" @change="onUploadFileChange" class="form-control" style="max-width:300px;margin:0 auto;">
           </div>
 
           <!-- Step 2: 选择工作表 -->
@@ -618,7 +622,15 @@
               </div>
               <div class="col-md-6">
                 <label class="form-label">模型名称</label>
-                <input v-model="aiConfigForm.model" class="form-control" placeholder="gpt-3.5-turbo">
+                <div class="input-group">
+                  <input v-model="aiConfigForm.model" class="form-control" placeholder="例: gpt-3.5-turbo" list="modelSuggestions">
+                  <button class="btn btn-outline-secondary" type="button" @click="refreshAIModels()" :disabled="refreshingModels" title="从 API 刷新可用模型列表">
+                    <span v-if="refreshingModels">⟳</span><span v-else>🔄</span>
+                  </button>
+                  <datalist id="modelSuggestions">
+                    <option v-for="m in cachedModelList" :key="m" :value="m">{{ m }}</option>
+                  </datalist>
+                </div>
               </div>
               <div class="col-12">
                 <label class="form-label">系统提示词</label>
@@ -669,6 +681,27 @@
             <p style="font-size:13px;color:var(--text-secondary);">上传之前备份的 .db 文件恢复数据（⚠ 会覆盖当前所有数据）</p>
             <input type="file" accept=".db" @change="restoreBackup" class="form-control">
           </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ==================== 退出确认模态框 ==================== -->
+  <div class="modal-backdrop" v-if="showExitConfirm" @click.self="showExitConfirm = false">
+    <div class="modal-dialog" style="max-width:400px;" @click.stop>
+      <div class="modal-content">
+        <div class="modal-header">
+          <h5 class="modal-title">🚪 退出程序</h5>
+          <button type="button" class="btn-close" @click="showExitConfirm = false"></button>
+        </div>
+        <div class="modal-body" style="text-align:center;padding:24px;">
+          <div style="font-size:48px;margin-bottom:16px;">👋</div>
+          <p style="font-size:16px;font-weight:500;margin-bottom:8px;">确定要退出程序吗？</p>
+          <p style="font-size:13px;color:var(--text-secondary);">退出前请确保数据已保存。</p>
+        </div>
+        <div class="modal-footer" style="justify-content:center;">
+          <button class="btn btn-outline-secondary" @click="showExitConfirm = false">取消</button>
+          <button class="btn btn-danger" @click="exitApp()">确认退出</button>
         </div>
       </div>
     </div>

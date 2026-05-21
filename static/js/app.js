@@ -72,6 +72,13 @@ const app = createApp({
 
       // ---- 备份 ----
       showBackupModal: false,
+      // ---- 退出程序 ----
+      showExitConfirm: false,
+      // ---- 大文件上传警告 ----
+      uploadWarnLarge: null,
+      // ---- AI 模型刷新 ----
+      refreshingModels: false,
+      cachedModelList: [],
 
       // ---- 空间重命名 ----
       renamingSpace: false,
@@ -224,6 +231,7 @@ const app = createApp({
         samplingN: 50000, xType: '', xCol: ''
       };
       this.uploadConfirming = false;
+      this.uploadWarnLarge = null;
     },
 
     openUploadModal() {
@@ -231,20 +239,30 @@ const app = createApp({
       this.showUploadModal = true;
     },
 
-    onUploadFileChange(event) {
+    async onUploadFileChange(event) {
       const file = event.target.files[0];
       if (!file) return;
-      const ext = file.name.split('.').pop().toLowerCase();
-      if (!['xlsx', 'xls'].includes(ext)) {
-        this.toast('仅支持 .xlsx 或 .xls 文件', 'error');
-        return;
-      }
-      if (file.size > 50 * 1024 * 1024) {
-        this.toast('文件超过 50MB 限制', 'error');
-        return;
+      // 检查文件大小
+      const sizeMB = file.size / (1024 * 1024);
+      if (sizeMB > 100) {
+        this.uploadWarnLarge = '100';
+      } else {
+        this.uploadWarnLarge = null;
       }
       this.uploadFile = file;
-      this.uploadStep = 2;
+      this.uploadStep = 1;
+      // 创建 FormData 上传
+      const formData = new FormData();
+      formData.append('file', file);
+      try {
+        const result = await this.api('POST', `/spaces/${this.currentSpaceId}/datasets`, formData, true);
+        this.uploadDatasetId = result.id;
+        this.uploadSheets = result.sheets || [];
+        this.uploadSelectedSheet = result.sheets?.[0] || '';
+        this.uploadStep = 2;
+      } catch (e) {
+        // error handled by api()
+      }
     },
 
     async confirmUploadSheet() {
@@ -479,6 +497,7 @@ const app = createApp({
         max_tokens: 2000, temperature: 0.7, is_default: false
       };
       this.editingAIConfigId = null;
+      this.cachedModelList = [];
     },
 
     editAIConfig(config) {
@@ -493,6 +512,7 @@ const app = createApp({
         temperature: config.temperature,
         is_default: config.is_default
       };
+      this.cachedModelList = config.cached_models || [];
     },
 
     async saveAIConfig() {
@@ -529,6 +549,26 @@ const app = createApp({
 
     cancelAIConfigEdit() {
       this.resetAIConfigForm();
+    },
+
+    async refreshAIModels() {
+      if (!this.editingAIConfigId) {
+        this.toast('请先保存 AI 配置再刷新模型', 'warning');
+        return;
+      }
+      this.refreshingModels = true;
+      try {
+        const result = await this.api('POST', `/ai-configs/${this.editingAIConfigId}/refresh-models`);
+        this.cachedModelList = result.models || [];
+        this.toast(result.message || '模型列表已刷新');
+        if (this.cachedModelList.length > 0) {
+          this.aiConfigForm.model = this.cachedModelList[0];
+        }
+      } catch (e) {
+        // handled by api()
+      } finally {
+        this.refreshingModels = false;
+      }
     },
 
     // ======================== AI 绑定 & 聊天 ========================
@@ -621,6 +661,19 @@ const app = createApp({
     // ======================== 备份与导出 ========================
     openBackupModal() {
       this.showBackupModal = true;
+    },
+
+    async exitApp() {
+      try {
+        await this.api('POST', '/system/shutdown');
+        this.showExitConfirm = false;
+        this.toast('程序正在关闭...');
+        setTimeout(() => {
+          document.body.innerHTML = '<div style="display:flex;justify-content:center;align-items:center;height:100vh;font-family:sans-serif;"><div style="text-align:center;"><h2>👋 程序已退出</h2><p style="color:#666;">您可以关闭此窗口</p></div></div>';
+        }, 1000);
+      } catch (e) {
+        // handled by api()
+      }
     },
 
     downloadBackup() {
