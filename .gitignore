@@ -11,3 +11,9 @@ uploads/*
 .DS_Store
 Thumbs.db
 backup/
+excelany.db
+_test_integration.db
+dist/
+build/
+*.spec
+.pytest_cache/
