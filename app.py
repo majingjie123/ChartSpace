@@ -43,7 +43,9 @@ BACKUP_FOLDER = os.path.join(APP_DIR, 'backup')
 # ---------------------------------------------------------------------------
 # Flask 应用初始化
 # ---------------------------------------------------------------------------
-app = Flask(__name__, template_folder=get_resource_path('templates'))
+app = Flask(__name__, 
+            template_folder=get_resource_path('templates'),
+            static_folder=get_resource_path('static'))
 # 修改 Jinja2 定界符，避免与 Vue.js 的 {{ }} 冲突
 app.jinja_env.variable_start_string = '(('
 app.jinja_env.variable_end_string = '))'
@@ -297,8 +299,10 @@ def list_spaces():
 def create_space():
     """创建空间"""
     data = request.get_json(silent=True) or {}
-    name = data.get('name', '新空间')
-    space = Space(name=name)
+    name = data.get('name')
+    if not name or not name.strip():
+        raise APIError('空间名称不能为空')
+    space = Space(name=name.strip())
     db_session.add(space)
     db_session.commit()
     return jsonify(space.to_dict()), 201
@@ -1298,8 +1302,21 @@ def main():
     init_db()
     port = int(os.environ.get('PORT', 5000))
     debug = not getattr(sys, 'frozen', False)
+    
+    # 打包环境自动打开浏览器
+    if not debug:
+        import webbrowser
+        import threading
+        
+        def open_browser():
+            import time
+            time.sleep(1.5)
+            webbrowser.open(f'http://127.0.0.1:{port}')
+            
+        threading.Thread(target=open_browser, daemon=True).start()
+        
     app.logger.info(f'服务启动: http://127.0.0.1:{port}')
-    app.run(host='0.0.0.0', port=port, debug=debug, use_reloader=False)
+    app.run(host='127.0.0.1', port=port, debug=debug, use_reloader=False)
 
 if __name__ == '__main__':
     main()
