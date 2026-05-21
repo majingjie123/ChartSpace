@@ -12,6 +12,7 @@ from datetime import datetime, timedelta
 
 import numpy as np
 import pandas as pd
+import threading
 from flask import (Flask, jsonify, request, send_file, send_from_directory,
                    render_template)
 from flask_cors import CORS
@@ -1390,7 +1391,6 @@ def main():
     # 打包环境自动打开浏览器
     if not debug:
         import webbrowser
-        import threading
         
         def open_browser():
             import time
