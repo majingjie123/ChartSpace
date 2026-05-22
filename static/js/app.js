@@ -13,6 +13,8 @@ const app = createApp({
 
       // ---- 数据集 ----
       datasets: [],
+      editingDatasetId: null,
+      editingDatasetName: '',
 
       // ---- 上传流程 ----
       showUploadModal: false,
@@ -35,18 +37,21 @@ const app = createApp({
       // ---- 图表 ----
       charts: [],
       renderedCharts: {},
+      chartJsons: {},
       trendInfos: {},
       showNewChartModal: false,
       showEditChartModal: false,
       editChartId: null,
+      showChartZoomModal: false,
+      zoomedChart: null,
+      zoomedChartHtml: '',
       newChartStep: 1,
       newChartForm: {
         dataset_id: '', name: '', chart_type: 'scatter',
         x_col: '', y_col: '', y2_col: '',
         trend_enabled: true,
-        config: { title: '', x_label: '', y_label: '', color: '#4f6ef7' }
-      },
-      chartDatasetColumns: [],
+        config: { title: '', x_label: '', y_label: '', color: '#4f6ef7', color2: '#ff7f0e' }
+        },      chartDatasetColumns: [],
       chartLoading: {},
 
       // ---- AI 配置 ----
@@ -66,9 +71,12 @@ const app = createApp({
       chatLoading: false,
       selectedAiDatasetId: null,
       activeTab: 'chat',
+      isChatCollapsed: false,
 
       // ---- 笔记 ----
       notes: [],
+      showNoteDetailModal: false,
+      selectedNote: null,
 
       // ---- 备份 ----
       showBackupModal: false,
@@ -401,6 +409,32 @@ const app = createApp({
       this.toast('数据集已删除');
     },
 
+    startRenameDataset(ds) {
+      this.editingDatasetId = ds.id;
+      this.editingDatasetName = ds.name;
+      this.$nextTick(() => {
+        const inputs = this.$refs.dsRenameInput;
+        if (inputs && inputs.length > 0) inputs[0].focus();
+      });
+    },
+
+    async confirmRenameDataset(ds) {
+      if (this.editingDatasetId !== ds.id) return;
+      const newName = this.editingDatasetName.trim();
+      if (!newName || newName === ds.name) {
+        this.editingDatasetId = null;
+        return;
+      }
+      try {
+        const updated = await this.api('PUT', `/datasets/${ds.id}`, { name: newName });
+        const idx = this.datasets.findIndex(d => d.id === ds.id);
+        if (idx >= 0) this.datasets[idx].name = updated.name;
+        this.toast('数据集已重命名');
+      } catch (e) { /* handled */ } finally {
+        this.editingDatasetId = null;
+      }
+    },
+
     // ======================== 图表管理 ========================
     async loadCharts() {
       if (!this.currentSpaceId) return;
@@ -420,18 +454,21 @@ const app = createApp({
       this.chartLoading = { ...this.chartLoading, [chartId]: true };
       try {
         const result = await this.api('GET', `/charts/${chartId}/render`);
-        this.renderedCharts = { ...this.renderedCharts, [chartId]: result.chart_html };
+        // 缓存 JSON 数据供全屏使用
+        this.chartJsons = { ...this.chartJsons, [chartId]: result.chart_json };
         this.trendInfos = { ...this.trendInfos, [chartId]: result.trend_info };
-        // 重新执行 Plotly 脚本
+        
         await nextTick();
-        const scripts = document.querySelectorAll(`#chart-${chartId} script`);
-        scripts.forEach(s => {
-          const newScript = document.createElement('script');
-          newScript.text = s.textContent;
-          s.parentNode.replaceChild(newScript, s);
-        });
+        const container = document.getElementById(`chart-container-${chartId}`);
+        if (container && typeof Plotly !== 'undefined') {
+          // 清空容器并使用原生方法渲染
+          container.innerHTML = '';
+          const config = { responsive: true, displayModeBar: false };
+          Plotly.newPlot(container, result.chart_json.data, result.chart_json.layout, config);
+        }
       } catch (e) {
-        this.renderedCharts = { ...this.renderedCharts, [chartId]: '<div class="text-danger p-3">图表渲染失败</div>' };
+        const container = document.getElementById(`chart-container-${chartId}`);
+        if (container) container.innerHTML = '<div class="text-danger p-3">图表渲染失败，请检查数据集。</div>';
       } finally {
         this.chartLoading = { ...this.chartLoading, [chartId]: false };
       }
@@ -462,6 +499,19 @@ const app = createApp({
           name: c,
           type: preview.col_types[c] || 'text'
         }));
+        
+        // 智能自动填入默认列
+        if (this.chartDatasetColumns.length >= 2 && !this.newChartForm.x_col) {
+          this.newChartForm.x_col = this.chartDatasetColumns[0].name;
+          this.newChartForm.y_col = this.chartDatasetColumns[1].name;
+          
+          // 自动起名
+          const ds = this.datasets.find(d => d.id === datasetId);
+          if (ds && !this.newChartForm.name) {
+            this.newChartForm.name = `${this.newChartForm.y_col} 随 ${this.newChartForm.x_col} 的分析图`;
+            this.newChartForm.config.title = this.newChartForm.name;
+          }
+        }
       } catch (e) {
         this.chartDatasetColumns = [];
       }
@@ -528,13 +578,54 @@ const app = createApp({
       this.toast('图表已删除');
     },
 
+    zoomChart(chart) {
+      this.zoomedChart = chart;
+      this.showChartZoomModal = true;
+
+      this.$nextTick(() => {
+        setTimeout(() => {
+          const container = document.getElementById(`chart-zoom-container-${chart.id}`);
+          const jsonData = this.chartJsons[chart.id];
+          
+          if (container && jsonData && typeof Plotly !== 'undefined') {
+            container.innerHTML = '';
+            // 深度克隆 layout 以免修改原始缓存，并开启响应式
+            const fullLayout = JSON.parse(JSON.stringify(jsonData.layout));
+            fullLayout.autosize = true;
+            
+            const config = { responsive: true, displayModeBar: false };
+            Plotly.newPlot(container, jsonData.data, fullLayout, config);
+            
+            // 强制触发一次 resize
+            Plotly.Plots.resize(container);
+          }
+        }, 300);
+      });
+    },
+
     exportChartCsv(chart) {
       window.open(`/api/charts/${chart.id}/export-csv`, '_blank');
     },
 
     exportChartImage(chart) {
-      window.open(`/api/charts/${chart.id}/export-image`, '_blank');
-      this.toast('图片导出中，请稍候...');
+      const el = document.getElementById(`chart-${chart.id}`);
+      if (el && typeof Plotly !== 'undefined') {
+        this.toast('正在生成图片...');
+        Plotly.downloadImage(el, {
+          format: 'png',
+          width: 1200,
+          height: 700,
+          filename: `${chart.name}_数据分析图`
+        }).then(() => {
+          this.toast('导出成功');
+        }).catch(err => {
+          console.error('前端导出失败，尝试后端导出', err);
+          window.open(`/api/charts/${chart.id}/export-image`, '_blank');
+        });
+      } else {
+        window.open(`/api/charts/${chart.id}/export-image`, '_blank');
+        this.toast('后端导出中，请稍候...');
+      }
     },
 
     // ======================== AI 配置 ========================
@@ -617,7 +708,7 @@ const app = createApp({
       try {
         let result;
         const f = this.aiConfigForm;
-        if (this.editingAIConfigId) {
+        if (Number.isInteger(this.editingAIConfigId)) {
           // 已有保存的配置 → 用已有记录刷新
           result = await this.api('POST', `/ai-configs/${this.editingAIConfigId}/refresh-models`);
         } else {
@@ -646,9 +737,14 @@ const app = createApp({
     // ======================== AI 绑定 & 聊天 ========================
     async bindSpaceAIConfig(aiConfigId) {
       if (!this.currentSpaceId) return;
+      const id = (aiConfigId === 'null' || !aiConfigId) ? null : parseInt(aiConfigId);
       try {
-        await this.api('POST', `/spaces/${this.currentSpaceId}/ai-config`, { ai_config_id: aiConfigId });
-        this.toast('AI 配置已绑定到空间');
+        await this.api('POST', `/spaces/${this.currentSpaceId}/ai-config`, { ai_config_id: id });
+        const idx = this.spaces.findIndex(s => s.id === this.currentSpaceId);
+        if (idx >= 0) {
+          this.spaces[idx].ai_config_id = id;
+        }
+        this.toast(id ? 'AI 配置已绑定到空间' : '已恢复为默认 AI 配置');
       } catch (e) { /* handled */ }
     },
 
@@ -675,6 +771,27 @@ const app = createApp({
       if (e.key === 'Enter' && !e.shiftKey) {
         e.preventDefault();
         this.sendChatMessage();
+      }
+    },
+
+    async copyToClipboard(text) {
+      if (!text) return;
+      try {
+        if (navigator.clipboard && navigator.clipboard.writeText) {
+          await navigator.clipboard.writeText(text);
+          this.toast('已复制到剪贴板');
+        } else {
+          // 回退到 execCommand
+          const textArea = document.createElement("textarea");
+          textArea.value = text;
+          document.body.appendChild(textArea);
+          textArea.select();
+          document.execCommand("copy");
+          document.body.removeChild(textArea);
+          this.toast('已复制到剪贴板');
+        }
+      } catch (err) {
+        this.toast('复制失败', 'error');
       }
     },
 
@@ -736,8 +853,8 @@ const app = createApp({
     },
 
     viewNote(note) {
-      // 显示笔记详情
-      alert(`【${note.title}】\n\n${note.content}`);
+      this.selectedNote = note;
+      this.showNoteDetailModal = true;
     },
 
     // ======================== 备份与导出 ========================
@@ -823,7 +940,12 @@ const app = createApp({
 
     renderMarkdown(text) {
       if (!text) return '';
-      return text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/\n/g, '<br>').replace(/```([\s\S]*?)```/g, '<pre><code>$1</code></pre>').replace(/`([^`]+)`/g, '<code>$1</code>').replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>').replace(/\*(.+?)\*/g, '<em>$1</em>');
+      // 使用 marked.js 渲染 Markdown
+      if (typeof marked !== 'undefined') {
+        return marked.parse(text);
+      }
+      // 回退方案：基本的转义和换行处理
+      return text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/\n/g, '<br>');
     },
 
     exportTrendCsv(chartId) {

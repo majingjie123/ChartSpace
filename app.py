@@ -182,7 +182,13 @@ class Space(Base):
     space_ai_configs = relationship('SpaceAIConfig', back_populates='space', cascade='all, delete-orphan')
 
     def to_dict(self):
-        return {'id': self.id, 'name': self.name, 'created_at': self.created_at.isoformat() if self.created_at else None}
+        binding = self.space_ai_configs[0] if self.space_ai_configs else None
+        return {
+            'id': self.id, 
+            'name': self.name, 
+            'created_at': self.created_at.isoformat() if self.created_at else None,
+            'ai_config_id': binding.ai_config_id if binding else None
+        }
 
 
 class Dataset(Base):
@@ -632,6 +638,21 @@ def preprocess_dataset(dataset_id):
         raise APIError(f'预处理失败: {str(e)}')
 
 
+@app.route('/api/datasets/<int:dataset_id>', methods=['PUT'])
+def rename_dataset(dataset_id):
+    """重命名数据集"""
+    ds = db_session.get(Dataset, dataset_id)
+    if not ds:
+        raise APIError('数据集不存在', 404)
+    data = request.get_json(silent=True) or {}
+    name = data.get('name')
+    if not name or not name.strip():
+        raise APIError('数据集名称不能为空')
+    ds.name = name.strip()
+    db_session.commit()
+    return jsonify(ds.to_dict())
+
+
 @app.route('/api/datasets/<int:dataset_id>', methods=['DELETE'])
 def delete_dataset(dataset_id):
     """删除数据集（同时删除关联图表）"""
@@ -737,8 +758,15 @@ def _build_plotly_json(df, chart, trend_result=None):
     title = chart_config.get('title', chart.name)
     x_label = chart_config.get('x_label', chart.x_col or '')
     y_label = chart_config.get('y_label', chart.y_col or '')
+    
     color_theme = chart_config.get('color', '#1f77b4')
+    secondary_color_cfg = chart_config.get('color2', '#ff7f0e')
     chart_type = chart.chart_type or 'scatter'
+    
+    # 高级选项
+    show_labels = chart_config.get('show_labels', False)
+    is_smooth = chart_config.get('smooth', False)
+    show_mean = chart_config.get('show_mean', False)
 
     x_col = chart.x_col
     y_col = chart.y_col
@@ -748,88 +776,129 @@ def _build_plotly_json(df, chart, trend_result=None):
     if x_col and x_col in df.columns and y_col and y_col in df.columns:
         x_data = df[x_col].dropna()
         y_data = df[y_col].dropna()
-        # 对齐
         common = x_data.index.intersection(y_data.index)
         x_vals = x_data.loc[common].tolist()
         y_vals = y_data.loc[common].tolist()
     else:
         x_vals, y_vals = [], []
 
+    # 副轴数据
+    y2_vals = []
+    if y2_col and y2_col in df.columns and x_col in df.columns:
+        y2_data = df[y2_col].dropna()
+        common2 = x_data.index.intersection(y2_data.index)
+        y2_vals = y2_data.loc[common2].tolist()
+
     fig = go.Figure()
 
-    use_gl = len(x_vals) > 5000 and chart_type in ('scatter', 'line')
+    # 颜色配置
+    primary_color = color_theme
+    secondary_color = secondary_color_cfg
 
-    # 主 trace
+    # 主轴 Trace 公共配置
+    trace_common = dict(
+        x=x_vals, y=y_vals, name=y_col,
+        text=[f"{v}" for v in y_vals] if show_labels else None,
+        textposition='top center' if show_labels else None
+    )
+
     if chart_type == 'scatter':
-        trace_type = 'scattergl' if use_gl else 'scatter'
-        fig.add_trace(go.Scattergl(
-            x=x_vals, y=y_vals, mode='markers',
-            name=chart.name, marker=dict(color=color_theme, size=6)
-        ) if use_gl else go.Scatter(
-            x=x_vals, y=y_vals, mode='markers',
-            name=chart.name, marker=dict(color=color_theme, size=6)
+        fig.add_trace(go.Scatter(
+            **trace_common, mode='markers+text' if show_labels else 'markers',
+            marker=dict(color=primary_color, size=8, line=dict(width=1, color='white'))
         ))
     elif chart_type == 'line':
-        trace_type = 'scattergl' if use_gl else 'scatter'
-        fig.add_trace(go.Scattergl(
-            x=x_vals, y=y_vals, mode='lines+markers',
-            name=chart.name, marker=dict(color=color_theme),
-            line=dict(color=color_theme)
-        ) if use_gl else go.Scatter(
-            x=x_vals, y=y_vals, mode='lines+markers',
-            name=chart.name, marker=dict(color=color_theme),
-            line=dict(color=color_theme)
+        fig.add_trace(go.Scatter(
+            **trace_common, mode='lines+markers+text' if show_labels else 'lines+markers',
+            line=dict(color=primary_color, width=3, shape='spline' if is_smooth else 'linear'),
+            marker=dict(color=primary_color, size=6)
         ))
     elif chart_type == 'bar':
-        fig.add_trace(go.Bar(x=x_vals, y=y_vals, name=chart.name,
-                             marker_color=color_theme))
+        fig.add_trace(go.Bar(
+            x=x_vals, y=y_vals, name=y_col,
+            text=[f"{v}" for v in y_vals] if show_labels else None,
+            textposition='auto' if show_labels else None,
+            marker_color=primary_color
+        ))
     elif chart_type == 'area':
-        fig.add_trace(go.Scatter(x=x_vals, y=y_vals, mode='lines',
-                                 fill='tozeroy', name=chart.name,
-                                 line=dict(color=color_theme)))
+        fig.add_trace(go.Scatter(
+            **trace_common, mode='lines+text' if show_labels else 'lines',
+            fill='tozeroy', line=dict(color=primary_color, width=2, shape='spline' if is_smooth else 'linear')
+        ))
     elif chart_type == 'box':
-        if y2_col and y2_col in df.columns:
-            fig.add_trace(go.Box(y=df[y_col].dropna(), name=y_col,
-                                 marker_color=color_theme))
-            fig.add_trace(go.Box(y=df[y2_col].dropna(), name=y2_col,
-                                 marker_color=color_theme))
-        else:
-            fig.add_trace(go.Box(y=y_vals, name=chart.name,
-                                 marker_color=color_theme))
+        fig.add_trace(go.Box(y=df[y_col].dropna() if y_col in df.columns else [], 
+                             name=y_col, marker_color=primary_color))
     elif chart_type == 'pie':
         if y2_col and y2_col in df.columns:
             labels = df[y2_col].dropna().unique()[:20]
             values = df.groupby(y2_col)[y_col].sum().values[:20]
         else:
-            # 使用 X 列前 20 个值作为标签
             labels = x_vals[:20] if x_vals else []
             values = y_vals[:20] if y_vals else []
         fig.add_trace(go.Pie(labels=labels, values=values, name=chart.name))
 
-    # 趋势线（散点/折线/柱状图）
+    # 副轴 Trace (如果有 Y2)
+    if y2_vals and chart_type in ('scatter', 'line', 'bar', 'area'):
+        fig.add_trace(go.Scatter(
+            x=x_vals, y=y2_vals, mode='lines+markers',
+            name=y2_col, yaxis='y2',
+            line=dict(color=secondary_color, width=2, shape='spline' if is_smooth else 'linear'),
+            marker=dict(color=secondary_color, size=6)
+        ))
+    elif y2_col and y2_col in df.columns and chart_type == 'box':
+        fig.add_trace(go.Box(y=df[y2_col].dropna(), name=y2_col,
+                             marker_color=secondary_color))
+
+    # 平均值辅助线
+    if show_mean and y_vals:
+        import numpy as np
+        valid_y = [v for v in y_vals if v is not None and isinstance(v, (int, float))]
+        if valid_y:
+            mean_val = float(np.mean(valid_y))
+            fig.add_shape(
+                type="line", line=dict(color="gray", width=1.5, dash="dash"),
+                x0=0, x1=1, xref="paper", y0=mean_val, y1=mean_val, yref="y"
+            )
+            fig.add_annotation(
+                x=0.01, y=mean_val, xref="paper", yref="y",
+                text=f"均值: {mean_val:.2f}", showarrow=False,
+                font=dict(color="gray", size=10), bgcolor="rgba(255,255,255,0.8)",
+                yshift=10, xanchor="left"
+            )
+
+    # 趋势线
     if trend_result and chart.trend_enabled and chart_type in ('scatter', 'line', 'bar'):
-        # 拟合线
         fig.add_trace(go.Scatter(
             x=trend_result.x_fit, y=trend_result.y_fit,
             mode='lines', name='趋势线',
-            line=dict(color='red', dash='dash', width=2)
-        ))
-        # 预测点
-        fig.add_trace(go.Scatter(
-            x=trend_result.x_pred, y=trend_result.y_pred,
-            mode='markers', name='预测值',
-            marker=dict(color='green', symbol='star', size=12)
+            line=dict(color='#d62728', dash='dot', width=2) # 趋势线用点划线
         ))
 
-    fig.update_layout(
-        title=title,
-        xaxis_title=x_label,
-        yaxis_title=y_label,
-        template='plotly_white',
-        hovermode='closest',
-        margin=dict(l=40, r=20, t=40, b=40),
-        height=400
-    )
+    # 布局配置
+    layout_args = {
+        'title': dict(text=title, x=0.5, font=dict(size=18, color='#1e293b')),
+        'xaxis': dict(title=x_label, gridcolor='#f1f5f9', zerolinecolor='#e2e8f0'),
+        'yaxis': dict(title=y_label, gridcolor='#f1f5f9', zerolinecolor='#e2e8f0'),
+        'template': 'plotly_white',
+        'hovermode': 'x unified',
+        'margin': dict(l=60, r=60, t=80, b=60),
+        'height': 450,
+        'legend': dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+        'plot_bgcolor': 'white',
+        'paper_bgcolor': 'white'
+    }
+
+    # 如果启用了副轴，增加副轴配置
+    if y2_vals:
+        layout_args['yaxis2'] = dict(
+            title=y2_col,
+            overlaying='y',
+            side='right',
+            showgrid=False,
+            zerolinecolor='#e2e8f0'
+        )
+
+    fig.update_layout(**layout_args)
     return fig
 
 
@@ -958,10 +1027,9 @@ def render_chart(chart_id):
                 }
 
     fig = _build_plotly_json(df, chart, trend_result)
-    chart_html = fig.to_html(full_html=False, include_plotlyjs='cdn', div_id=f'chart-{chart_id}')
-
+    
     return jsonify({
-        'chart_html': chart_html,
+        'chart_json': json.loads(fig.to_json()),
         'chart_data': chart.to_dict(),
         'trend_info': trend_info
     })
@@ -994,19 +1062,27 @@ def export_chart_csv(chart_id):
             tr = None
         if tr:
             out_df = pd.DataFrame({
-                'X': tr.x_orig,
-                'Y': tr.y_orig,
-                'Y_fit': tr.y_fit
+                '数据点类型': ['原始数据'] * len(tr.x_orig),
+                'X (自变量)': tr.x_orig,
+                'Y (观测值)': tr.y_orig,
+                'Y_fit (拟合值)': tr.y_fit,
+                '偏差 (残差)': [round(y_o - y_f, 4) for y_o, y_f in zip(tr.y_orig, tr.y_fit)]
             })
             # 追加预测行
             pred_df = pd.DataFrame({
-                'X': tr.x_pred,
-                'Y': ['']*3,
-                'Y_fit': tr.y_pred
+                '数据点类型': ['未来预测'] * len(tr.x_pred),
+                'X (自变量)': tr.x_pred,
+                'Y (观测值)': [''] * len(tr.x_pred),
+                'Y_fit (拟合值)': tr.y_pred,
+                '偏差 (残差)': [''] * len(tr.x_pred)
             })
             out_df = pd.concat([out_df, pred_df], ignore_index=True)
         else:
-            out_df = pd.DataFrame({'X': x_vals, 'Y': y_vals, 'Y_fit': ['']*len(x_vals)})
+            out_df = pd.DataFrame({
+                '数据点类型': ['原始数据'] * len(x_vals),
+                'X (自变量)': x_vals,
+                'Y (观测值)': y_vals
+            })
     else:
         out_df = pd.DataFrame({'X': x_vals, 'Y': y_vals, 'Y_fit': ['']*len(x_vals)})
 
@@ -1045,11 +1121,16 @@ def export_chart_image(chart_id):
                     trend_result = None
 
     fig = _build_plotly_json(df, chart, trend_result)
+    # 导出时优化样式：确保字体清晰且包含标题
+    fig.update_layout(
+        font=dict(family='SimHei, "Microsoft YaHei", sans-serif', size=14),
+        title_font=dict(size=20)
+    )
     img_path = os.path.join(UPLOAD_FOLDER, f'chart_{chart_id}.png')
-    fig.write_image(img_path, format='png', width=900, height=500, scale=2)
+    fig.write_image(img_path, format='png', width=1000, height=600, scale=2)
     return send_file(img_path, mimetype='image/png',
                      as_attachment=True,
-                     download_name=f'{chart.name}.png')
+                     download_name=f'{chart.name}_数据分析图.png')
 
 
 # -----------------------------------------------------------------------
@@ -1217,17 +1298,21 @@ def set_space_ai_config(space_id):
         raise APIError('空间不存在', 404)
     data = request.get_json(silent=True) or {}
     ai_config_id = data.get('ai_config_id')
-    if not ai_config_id:
-        raise APIError('请指定 AI 配置')
-    ai_config = db_session.get(AIConfig, ai_config_id)
-    if not ai_config:
-        raise APIError('AI 配置不存在')
+    
     # 删除旧绑定
     db_session.query(SpaceAIConfig).filter_by(space_id=space_id).delete()
-    binding = SpaceAIConfig(space_id=space_id, ai_config_id=ai_config_id)
-    db_session.add(binding)
+    
+    if ai_config_id:
+        ai_config = db_session.get(AIConfig, ai_config_id)
+        if not ai_config:
+            raise APIError('AI 配置不存在')
+        binding = SpaceAIConfig(space_id=space_id, ai_config_id=ai_config_id)
+        db_session.add(binding)
+        db_session.commit()
+        return jsonify(binding.to_dict())
+    
     db_session.commit()
-    return jsonify(binding.to_dict())
+    return jsonify({'message': '已解除绑定，将使用默认配置', 'ai_config_id': None})
 
 
 # -----------------------------------------------------------------------
@@ -1494,6 +1579,12 @@ def shutdown_server():
 def index():
     """返回前端 SPA 页面"""
     return render_template('index.html')
+
+@app.teardown_appcontext
+def shutdown_session(exception=None):
+    """请求结束时自动移除数据库会话，释放连接"""
+    db_session.remove()
+
 
 # ============================== 启动入口 =====================================
 
