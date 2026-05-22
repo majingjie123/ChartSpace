@@ -6,8 +6,12 @@
   <title>Excel 多空间智能图表分析工具</title>
   <!-- Bootstrap 5 CSS -->
   <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet">
+  <!-- GridStack.js CSS -->
+  <link href="https://cdn.jsdelivr.net/npm/gridstack@10.0.1/dist/gridstack.min.css" rel="stylesheet">
   <!-- Plotly.js -->
   <script src="https://cdn.plot.ly/plotly-2.35.2.min.js" charset="utf-8"></script>
+  <!-- GridStack.js -->
+  <script src="https://cdn.jsdelivr.net/npm/gridstack@10.0.1/dist/gridstack.all.js"></script>
   <!-- Vue 3 -->
   <script src="https://cdn.jsdelivr.net/npm/vue@3.5.13/dist/vue.global.prod.js"></script>
   <!-- Axios -->
@@ -50,13 +54,9 @@
 
       <div class="sidebar-menu-wrapper">
         <!-- 分组 1: 核心功能 -->
-        <div class="menu-group">
+        <div class="menu-group" v-if="currentSpaceId">
           <div class="menu-label">核心功能</div>
-          <div class="menu-item" :class="{ active: !currentSpaceId }" @click="switchSpace(null)">
-            <span class="menu-icon">🏠</span>
-            <span class="menu-text">控制台概览</span>
-          </div>
-          <div class="menu-item" @click="showNewChartModal = true" v-if="currentSpaceId">
+          <div class="menu-item" @click="showNewChartModal = true">
             <span class="menu-icon">📊</span>
             <span class="menu-text">新建分析图表</span>
           </div>
@@ -147,9 +147,9 @@
             </div>
           </div>
           <div class="breadcrumb-nav d-flex align-items-center" v-else>
-            <span class="breadcrumb-item">系统管理</span>
+            <span class="breadcrumb-item">ChartSpace</span>
             <span class="breadcrumb-separator">/</span>
-            <span class="breadcrumb-current">控制台概览</span>
+            <span class="breadcrumb-current">欢迎使用</span>
           </div>
         </div>
         
@@ -216,78 +216,151 @@
 
         <hr class="section-divider">
 
-        <!-- 图表区 -->
-        <div class="d-flex justify-content-between align-items-center mb-2">
-          <div class="section-title">📈 图表</div>
-          <div class="chart-global-actions">
-            <button class="btn btn-outline-secondary btn-sm me-2" @click="loadCharts()" :disabled="charts.length === 0" title="重新加载所有图表数据">🔄 刷新全部</button>
-            <button class="btn btn-primary btn-sm" @click="openNewChartModal()" :disabled="datasets.length === 0">+ 新建图表</button>
+        <!-- 看板系统 -->
+        <div class="dashboard-section mt-3">
+          <!-- 看板切换与管理 -->
+          <div class="d-flex justify-content-between align-items-center mb-3 flex-wrap gap-2">
+            <!-- 左侧看板 Tab 页 -->
+            <div class="d-flex align-items-center gap-1 overflow-x-auto" style="max-width: 65%;">
+              <ul class="nav nav-pills flex-nowrap" id="dashboard-tabs" role="tablist">
+                <li class="nav-item" v-for="db in dashboards" :key="db.id">
+                  <button class="nav-link px-3 py-1.5 position-relative text-nowrap d-flex align-items-center gap-1 rounded-pill"
+                          :class="{ active: db.id === activeDashboardId }"
+                          @click="switchDashboard(db.id)">
+                    📊 {{ db.name }}
+                    <span class="badge bg-light text-primary ms-1" style="font-size:10px;" v-if="db.refresh_interval > 0">⏱ {{ db.refresh_interval }}s</span>
+                    <span class="tab-close-btn ms-2 text-muted" style="cursor:pointer;" @click.stop="deleteDashboard(db.id)" v-if="dashboards.length > 1">×</span>
+                  </button>
+                </li>
+              </ul>
+              <button class="btn btn-outline-secondary btn-sm py-1 px-2.5 ms-2 rounded-circle" @click="createDashboard()" title="新建看板">+</button>
+            </div>
+            
+            <!-- 右侧看板控制操作 -->
+            <div class="d-flex align-items-center gap-2" v-if="activeDashboardId">
+              <!-- 自动轮询刷新 -->
+              <div class="input-group input-group-sm" style="width: 175px;">
+                <span class="input-group-text bg-white border-end-0">⏱ 刷新</span>
+                <select class="form-select border-start-0" :value="activeDashboard?.refresh_interval || 0" @change="changeRefreshInterval($event.target.value)">
+                  <option :value="0">不自动刷新</option>
+                  <option :value="5">每 5 秒刷新</option>
+                  <option :value="10">每 10 秒刷新</option>
+                  <option :value="30">每 30 秒刷新</option>
+                  <option :value="60">每 60 秒刷新</option>
+                </select>
+              </div>
+
+              <!-- 编辑/保存布局模式控制 -->
+              <template v-if="!isDashboardEditing">
+                <button class="btn btn-outline-primary btn-sm rounded-pill px-3" @click="startEditDashboardLayout()">✏️ 编辑看板</button>
+                <button class="btn btn-primary btn-sm rounded-pill px-3" @click="openNewComponentModal()" :disabled="datasets.length === 0">+ 添加组件</button>
+              </template>
+              <template v-else>
+                <button class="btn btn-success btn-sm rounded-pill px-3" @click="saveDashboardLayout()">💾 保存布局</button>
+                <button class="btn btn-outline-secondary btn-sm rounded-pill px-3" @click="cancelEditDashboardLayout()">取消</button>
+              </template>
+            </div>
           </div>
-        </div>
-        <div v-if="charts.length === 0 && !loading.charts" class="empty-state">
-          <div class="empty-icon">📊</div>
-          <h5>暂无图表</h5>
-          <p>导入数据集后点击「新建图表」创建可视化</p>
-        </div>
-        <div class="chart-grid" v-if="charts.length > 0">
-          <div v-for="ch in charts" :key="ch.id" class="chart-card">
-            <div class="chart-header">
-              <span class="chart-name">{{ ch.name }}</span>
-              <span class="chart-type-badge">{{ chartTypeLabel(ch.chart_type) }}</span>
-              <div class="chart-actions">
-                <button class="btn btn-sm btn-outline-secondary" @click="openEditChartModal(ch)" title="编辑图表">✏️</button>
-                <button class="btn btn-sm btn-outline-secondary" @click="deleteChart(ch.id)" title="删除图表">🗑</button>
-                <button class="btn btn-sm btn-outline-secondary" @click="exportChartCsv(ch)" title="导出 CSV">📄</button>
-                <button class="btn btn-sm btn-outline-secondary" @click="exportChartImage(ch)" title="导出图片">🖼</button>
-                <button class="btn btn-sm btn-outline-primary" @click="zoomChart(ch)" title="全屏查看">🔍</button>
-              </div>
-            </div>
-            <div class="chart-body">
-              <!-- 图表渲染容器 -->
-              <div :id="'chart-container-' + ch.id" style="width:100%;min-height:400px;"></div>
-              <!-- 加载动画 -->
-              <div v-if="chartLoading[ch.id]" class="loading-overlay">
-                <div class="loading-spinner"></div>
-              </div>
-            </div>
-            <!-- 趋势分析面板 -->
-            <div v-if="trendInfos[ch.id]" class="trend-panel">
-              <div class="trend-grid">
-                <div class="trend-item">
-                  <div class="trend-label">斜率</div>
-                  <div class="trend-value">{{ trendInfos[ch.id].slope.toFixed(4) }}</div>
-                </div>
-                <div class="trend-item">
-                  <div class="trend-label">截距</div>
-                  <div class="trend-value">{{ trendInfos[ch.id].intercept.toFixed(4) }}</div>
-                </div>
-                <div class="trend-item">
-                  <div class="trend-label">R²</div>
-                  <div class="trend-value">{{ trendInfos[ch.id].r2.toFixed(4) }}</div>
-                </div>
-                <div class="trend-item">
-                  <div class="trend-label">趋势</div>
-                  <div class="trend-value" :class="trendValueClass(trendInfos[ch.id].direction)">
-                    {{ trendIcon(trendInfos[ch.id].direction) }} {{ trendInfos[ch.id].direction }}
+
+          <!-- 看板重命名输入区域 -->
+          <div class="d-flex align-items-center gap-2 mb-3 bg-light p-2 rounded-3 border" v-if="activeDashboard && isDashboardEditing">
+            <span class="text-secondary" style="font-size:13px; font-weight:500;">看板重命名:</span>
+            <input type="text" v-model="editDashboardName" class="form-control form-control-sm" style="width: 220px;" placeholder="请输入看板新名称">
+            <button class="btn btn-primary btn-sm rounded-3 px-3" @click="renameDashboard()">确认修改</button>
+          </div>
+
+          <!-- GridStack 网格画布 -->
+          <div class="grid-stack-wrapper rounded-3" :class="{ 'editing-mode': isDashboardEditing }">
+            <div class="grid-stack" id="gridstack-container">
+              <div v-for="comp in activeDashboardComponents" 
+                   :key="comp.id" 
+                   class="grid-stack-item" 
+                   :gs-id="comp.id"
+                   :gs-x="comp.position.x !== undefined && comp.position.x !== null ? comp.position.x : undefined"
+                   :gs-y="comp.position.y !== undefined && comp.position.y !== null ? comp.position.y : undefined"
+                   :gs-w="comp.position.w || 4" 
+                   :gs-h="comp.position.h || 4"
+                   :gs-min-w="comp.component_type === 'kpi' ? 2 : 3"
+                   :gs-min-h="comp.component_type === 'kpi' ? 2 : 3">
+                <div class="grid-stack-item-content">
+                  <!-- 组件卡片头部 -->
+                  <div class="card-header bg-white py-2 px-3 d-flex align-items-center justify-content-between border-0">
+                    <span class="fw-bold text-truncate" style="font-size:13px; color:var(--text-primary);">
+                      {{ comp.title }}
+                    </span>
+                    <div class="comp-actions" v-if="isDashboardEditing">
+                      <button class="btn btn-link p-0 me-2 text-secondary text-decoration-none" style="font-size:12px;" @click.stop="openEditComponentModal(comp)">⚙️ 配置</button>
+                      <button class="btn btn-link p-0 text-danger text-decoration-none" style="font-size:12px;" @click.stop="deleteComponent(comp.id)">🗑 删除</button>
+                    </div>
+                  </div>
+                  <!-- 组件卡片内部 -->
+                  <div class="card-body p-2 flex-grow-1 d-flex flex-column overflow-auto position-relative" style="min-height:0;">
+                    <!-- 图表组件 -->
+                    <template v-if="comp.component_type === 'chart'">
+                      <div :id="'comp-chart-' + comp.id" style="width:100%; height:100%; flex-grow:1; min-height:150px;"></div>
+                      <div v-if="componentDataLoading[comp.id]" class="spinner-overlay">
+                        <div class="spinner-border spinner-border-sm text-primary" role="status"></div>
+                      </div>
+                      <div v-if="componentTrendInfos[comp.id]" class="trend-micro-panel">
+                        <span>R²: {{ componentTrendInfos[comp.id].r2.toFixed(3) }}</span>
+                        <span class="ms-2">趋势: {{ componentTrendInfos[comp.id].direction }}</span>
+                      </div>
+                    </template>
+
+                    <!-- KPI 指标卡组件 -->
+                    <template v-else-if="comp.component_type === 'kpi'">
+                      <div class="kpi-card-content d-flex flex-column justify-content-center align-items-center h-100 py-3">
+                        <div class="kpi-value" :class="componentData[comp.id]?.color_class || 'text-primary'">
+                          {{ componentData[comp.id]?.formatted_value || '计算中...' }}
+                        </div>
+                        <div class="kpi-title text-secondary mt-1">{{ componentData[comp.id]?.title || comp.title }}</div>
+                      </div>
+                    </template>
+
+                    <!-- 数据表格组件 -->
+                    <template v-else-if="comp.component_type === 'table'">
+                      <div class="table-responsive h-100 overflow-auto" style="font-size:12px;">
+                        <table class="table table-sm table-striped table-hover mb-0">
+                          <thead>
+                            <tr>
+                              <th v-for="col in componentData[comp.id]?.columns" :key="col" class="text-nowrap" style="position:sticky; top:0; background:#f8fafc; z-index:1;">
+                                {{ col }}
+                              </th>
+                            </tr>
+                          </thead>
+                          <tbody>
+                            <tr v-for="(row, rIdx) in componentData[comp.id]?.rows" 
+                                :key="rIdx" 
+                                @click="handleTableRowClick(comp, row)"
+                                :class="{'table-active': isRowSelected(comp.id, row)}"
+                                style="cursor:pointer;">
+                              <td v-for="col in componentData[comp.id]?.columns" :key="col" class="text-truncate" style="max-width:150px;">
+                                {{ row[col] !== null ? row[col] : '' }}
+                              </td>
+                            </tr>
+                          </tbody>
+                        </table>
+                        <div v-if="!componentData[comp.id]?.rows || componentData[comp.id]?.rows.length === 0" class="text-center py-4 text-muted">
+                          暂无数据
+                        </div>
+                      </div>
+                    </template>
+
+                    <!-- 富文本说明组件 -->
+                    <template v-else-if="comp.component_type === 'text'">
+                      <div class="markdown-body p-2" v-html="renderMarkdown(comp.config?.text_content || '')"></div>
+                    </template>
                   </div>
                 </div>
               </div>
-              <div v-if="trendInfos[ch.id].predictions && trendInfos[ch.id].predictions.length > 0">
-                <div style="font-size:12px;font-weight:600;margin-bottom:4px;color:var(--text-secondary);">📊 未来 3 期预测</div>
-                <table class="predict-table">
-                  <thead><tr><th>#</th><th>X</th><th>Y 预测</th></tr></thead>
-                  <tbody>
-                    <tr v-for="(p, pi) in trendInfos[ch.id].predictions" :key="pi">
-                      <td>{{ pi + 1 }}</td>
-                      <td>{{ typeof p.x === 'number' ? p.x.toFixed(2) : p.x }}</td>
-                      <td>{{ p.y_pred.toFixed(2) }}</td>
-                    </tr>
-                  </tbody>
-                </table>
-              </div>
-              <div class="mt-1">
-                <button class="btn btn-sm btn-outline-secondary" @click="exportTrendCsv(ch.id)">📄 导出趋势数据 CSV</button>
-              </div>
+            </div>
+            
+            <!-- 暂无组件提示状态 -->
+            <div v-if="activeDashboardComponents.length === 0 && !loading.dashboards" class="empty-state py-5 bg-white border border-dashed rounded-3">
+              <div class="empty-icon">📊</div>
+              <h5>此看板暂无任何组件</h5>
+              <p>请点击顶部「+ 添加组件」按钮将可视化图表、核心 KPI 指标卡、数据表格或富文本说明拖入网格中。</p>
+              <button class="btn btn-primary btn-sm rounded-pill px-4" @click="openNewComponentModal()" :disabled="datasets.length === 0">+ 立即添加组件</button>
             </div>
           </div>
         </div>
@@ -897,6 +970,186 @@
         <div class="modal-footer">
           <button class="btn btn-outline-secondary" @click="showChartZoomModal = false">关闭</button>
           <button class="btn btn-outline-primary" @click="exportChartImage(zoomedChart)">🖼 导出图片</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ==================== 模态框：组件配置 ==================== -->
+  <div class="modal-backdrop" v-if="showComponentModal" @click.self="showComponentModal = false">
+    <div class="modal-dialog modal-lg" @click.stop>
+      <div class="modal-content">
+        <div class="modal-header">
+          <h5 class="modal-title">🧩 {{ componentForm.id ? '配置看板组件' : '添加新组件' }}</h5>
+          <button type="button" class="btn-close" @click="showComponentModal = false"></button>
+        </div>
+        <div class="modal-body">
+          <div class="row g-3">
+            <!-- 组件标题 -->
+            <div class="col-md-6">
+              <label class="form-label">组件名称 <span class="text-danger">*</span></label>
+              <input v-model="componentForm.title" class="form-control" placeholder="请输入组件显示标题">
+            </div>
+            
+            <!-- 组件类型选择 -->
+            <div class="col-md-6">
+              <label class="form-label">组件类型 <span class="text-danger">*</span></label>
+              <select v-model="componentForm.component_type" class="form-select" @change="onComponentTypeChange" :disabled="!!componentForm.id">
+                <option value="chart">📊 可视化图表</option>
+                <option value="kpi">💎 KPI 指标卡</option>
+                <option value="table">📋 数据表格</option>
+                <option value="text">📝 富文本说明 (Markdown)</option>
+              </select>
+            </div>
+
+            <!-- 数据集选择：只有非文本类型组件需要 -->
+            <div class="col-md-12" v-if="componentForm.component_type !== 'text'">
+              <label class="form-label">关联数据集 <span class="text-danger">*</span></label>
+              <select v-model="componentForm.dataset_id" class="form-select" @change="onComponentDatasetChange">
+                <option value="">-- 请选择数据集 --</option>
+                <option v-for="ds in datasets" :key="ds.id" :value="ds.id">
+                  📂 {{ ds.name }} (共 {{ ds.row_count }} 行)
+                </option>
+              </select>
+            </div>
+
+            <!-- 动态配置板块：可视化图表 -->
+            <div class="col-md-12" v-if="componentForm.component_type === 'chart'">
+              <div class="card p-3 border-light-subtle bg-light bg-opacity-50 rounded-3">
+                <h6 class="fw-bold mb-3 text-primary" style="font-size:14px;">图表属性配置</h6>
+                <div class="row g-3">
+                  <div class="col-md-4">
+                    <label class="form-label">图表类型</label>
+                    <select v-model="componentForm.config.chart_type" class="form-select">
+                      <option value="scatter">🔴 散点图</option>
+                      <option value="line">📈 折线图</option>
+                      <option value="bar">📊 柱状图</option>
+                      <option value="box">📦 箱线图</option>
+                      <option value="area">🌊 面积图</option>
+                      <option value="pie">🍕 饼图</option>
+                    </select>
+                  </div>
+                  <div class="col-md-4">
+                    <label class="form-label">X轴字段 (维度/自变量)</label>
+                    <select v-model="componentForm.config.x_col" class="form-select">
+                      <option value="">-- 选择字段 --</option>
+                      <option v-for="col in componentDatasetColumns" :key="col.name" :value="col.name">
+                        {{ col.name }} ({{ col.type }})
+                      </option>
+                    </select>
+                  </div>
+                  <div class="col-md-4">
+                    <label class="form-label">Y轴字段 (度量/因变量)</label>
+                    <select v-model="componentForm.config.y_col" class="form-select">
+                      <option value="">-- 选择字段 --</option>
+                      <option v-for="col in componentDatasetColumns" :key="col.name" :value="col.name">
+                        {{ col.name }} ({{ col.type }})
+                      </option>
+                    </select>
+                  </div>
+                  <div class="col-md-6" v-if="['scatter', 'line', 'bar', 'area'].includes(componentForm.config.chart_type)">
+                    <label class="form-label">次Y轴字段 (Y2轴，可选)</label>
+                    <select v-model="componentForm.config.y2_col" class="form-select">
+                      <option value="">-- 无次轴 --</option>
+                      <option v-for="col in componentDatasetColumns" :key="col.name" :value="col.name">
+                        {{ col.name }} ({{ col.type }})
+                      </option>
+                    </select>
+                  </div>
+                  <div class="col-md-6 d-flex align-items-end pb-2" v-if="['scatter', 'line'].includes(componentForm.config.chart_type)">
+                    <div class="form-check form-switch">
+                      <input class="form-check-input" type="checkbox" id="flexSwitchTrend" v-model="componentForm.config.trend_enabled">
+                      <label class="form-check-label fw-medium" for="flexSwitchTrend">启用自动趋势线分析与未来预测</label>
+                    </div>
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            <!-- 动态配置板块：KPI 指标卡 -->
+            <div class="col-md-12" v-if="componentForm.component_type === 'kpi'">
+              <div class="card p-3 border-light-subtle bg-light bg-opacity-50 rounded-3">
+                <h6 class="fw-bold mb-3 text-primary" style="font-size:14px;">KPI 指标值计算配置</h6>
+                <div class="row g-3">
+                  <div class="col-md-6">
+                    <label class="form-label">数值列</label>
+                    <select v-model="componentForm.config.kpi_col" class="form-select">
+                      <option value="">-- 选择计算字段 --</option>
+                      <option v-for="col in componentDatasetColumns" :key="col.name" :value="col.name">
+                        {{ col.name }} ({{ col.type }})
+                      </option>
+                    </select>
+                  </div>
+                  <div class="col-md-6">
+                    <label class="form-label">计算方式 (聚合函数)</label>
+                    <select v-model="componentForm.config.kpi_agg" class="form-select">
+                      <option value="sum">➕ 求和 (SUM)</option>
+                      <option value="mean">🧮 平均值 (AVERAGE)</option>
+                      <option value="count">🔢 计数 (COUNT)</option>
+                      <option value="latest">📌 最新值 (LATEST)</option>
+                    </select>
+                  </div>
+                  <div class="col-md-4">
+                    <label class="form-label">保留小数位</label>
+                    <select v-model.number="componentForm.config.kpi_decimals" class="form-select">
+                      <option :value="0">0位</option>
+                      <option :value="1">1位</option>
+                      <option :value="2">2位</option>
+                      <option :value="3">3位</option>
+                      <option :value="4">4位</option>
+                    </select>
+                  </div>
+                  <div class="col-md-4">
+                    <label class="form-label">显示单位</label>
+                    <input type="text" v-model="componentForm.config.kpi_unit" class="form-control" placeholder="例如：元、个、%">
+                  </div>
+                  <div class="col-md-4">
+                    <label class="form-label">目标值 (可用于颜色判定)</label>
+                    <input type="number" v-model.number="componentForm.config.kpi_target" class="form-control" placeholder="达到目标变绿，未达变红">
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            <!-- 动态配置板块：数据表格 -->
+            <div class="col-md-12" v-if="componentForm.component_type === 'table'">
+              <div class="card p-3 border-light-subtle bg-light bg-opacity-50 rounded-3">
+                <h6 class="fw-bold mb-3 text-primary" style="font-size:14px;">表格参数配置</h6>
+                <div class="row g-3">
+                  <div class="col-md-6">
+                    <label class="form-label">最大分页大小 (每页展示行数)</label>
+                    <select v-model.number="componentForm.config.page_size" class="form-select">
+                      <option :value="5">5 行</option>
+                      <option :value="10">10 行</option>
+                      <option :value="20">20 行</option>
+                      <option :value="50">50 行</option>
+                      <option :value="100">100 行</option>
+                    </select>
+                  </div>
+                  <div class="col text-secondary d-flex align-items-center" style="font-size:12px; padding-top:28px;">
+                    💡 看板表格组件最大可提取展示 2000 行。在看板中，鼠标点击表格行，可对其他组件进行数据广播联动过滤。
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            <!-- 动态配置板块：富文本/Markdown 说明 -->
+            <div class="col-md-12" v-if="componentForm.component_type === 'text'">
+              <div class="card p-3 border-light-subtle bg-light bg-opacity-50 rounded-3">
+                <h6 class="fw-bold mb-3 text-primary" style="font-size:14px;">富文本/Markdown 说明内容</h6>
+                <div class="row g-3">
+                  <div class="col-md-12">
+                    <label class="form-label">编辑内容 (支持常用 Markdown 语法)</label>
+                    <textarea v-model="componentForm.config.text_content" class="form-control font-monospace" rows="6" placeholder="### 标题&#10;- 项目一&#10;- 项目二&#10;&#10;输入你的组件说明和分析结论..."></textarea>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+        <div class="modal-footer">
+          <button class="btn btn-outline-secondary rounded-pill px-4" @click="showComponentModal = false">取消</button>
+          <button class="btn btn-primary rounded-pill px-4" @click="confirmSaveComponent()">💾 确认保存</button>
         </div>
       </div>
     </div>

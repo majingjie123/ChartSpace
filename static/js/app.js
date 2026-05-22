@@ -109,7 +109,42 @@ const app = createApp({
       memTimer: null,
       
       // ---- 数据量级消息 ----
-      uploadVolMsg: ''
+      uploadVolMsg: '',
+
+      // ---- 看板与组件 ----
+      dashboards: [],
+      activeDashboardId: null,
+      isDashboardEditing: false,
+      isDashboardLayoutDirty: false,
+      editDashboardName: '',
+      activeDashboardComponents: [],
+      componentData: {},
+      componentDataLoading: {},
+      componentTrendInfos: {},
+      refreshTimers: {},
+      tableSelections: {},
+      showComponentModal: false,
+      componentForm: {
+        id: null,
+        title: '',
+        component_type: 'chart',
+        dataset_id: '',
+        config: {
+          chart_type: 'scatter',
+          x_col: '',
+          y_col: '',
+          y2_col: '',
+          trend_enabled: false,
+          kpi_col: '',
+          kpi_agg: 'sum',
+          kpi_decimals: 2,
+          kpi_unit: '',
+          kpi_target: null,
+          page_size: 10,
+          text_content: ''
+        }
+      },
+      componentDatasetColumns: []
     };
   },
 
@@ -119,6 +154,9 @@ const app = createApp({
     },
     spaceAiConfigId() {
       return this.currentSpace?.ai_config_id || null;
+    },
+    activeDashboard() {
+      return this.dashboards.find(d => d.id === this.activeDashboardId) || null;
     }
   },
 
@@ -129,6 +167,7 @@ const app = createApp({
         this.loadCharts();
         this.loadChatHistory();
         this.loadNotes();
+        this.loadDashboards();
       } else {
         this.datasets = [];
         this.charts = [];
@@ -136,6 +175,10 @@ const app = createApp({
         this.trendInfos = {};
         this.chatMessages = [];
         this.notes = [];
+        this.dashboards = [];
+        this.activeDashboardId = null;
+        this.activeDashboardComponents = [];
+        this.clearRefreshTimers();
       }
     }
   },
@@ -211,10 +254,17 @@ const app = createApp({
       this.loading.spaces = true;
       try {
         this.spaces = await this.api('GET', '/spaces');
-        if (this.spaces.length > 0 && !this.currentSpaceId) {
+        
+        // 静默自动兜底：当发现工作空间为空时，立即默默创建一个空间，避免产生无空间的空白态
+        if (this.spaces.length === 0) {
+          const space = await this.api('POST', '/spaces', { name: '默认工作空间' });
+          this.spaces.unshift(space);
+          this.currentSpaceId = space.id;
+          return;
+        }
+
+        if (!this.currentSpaceId) {
           this.currentSpaceId = this.spaces[0].id;
-        } else if (this.spaces.length === 0) {
-          this.currentSpaceId = null;
         }
       } finally {
         this.loading.spaces = false;
@@ -260,6 +310,12 @@ const app = createApp({
 
     switchSpace(id) {
       if (id !== this.currentSpaceId) {
+        // 卫语句：如果有未保存的布局修改，且用户取消切换，则直接拦截返回
+        if (this.isDashboardLayoutDirty && !confirm('当前看板布局尚未保存，切换工作空间将丢失更改，是否继续切换？')) {
+          return;
+        }
+        this.isDashboardEditing = false;
+        this.isDashboardLayoutDirty = false;
         this.currentSpaceId = id;
       }
     },
@@ -608,7 +664,9 @@ const app = createApp({
     },
 
     exportChartImage(chart) {
-      const el = document.getElementById(`chart-${chart.id}`);
+      // 优先从放大容器或常规图表卡片容器中寻找 Plotly 渲染的 DOM 节点
+      const el = document.getElementById(`chart-zoom-container-${chart.id}`) || 
+                 document.getElementById(`chart-container-${chart.id}`);
       if (el && typeof Plotly !== 'undefined') {
         this.toast('正在生成图片...');
         Plotly.downloadImage(el, {
@@ -627,6 +685,7 @@ const app = createApp({
         this.toast('后端导出中，请稍候...');
       }
     },
+
 
     // ======================== AI 配置 ========================
     async loadAIConfigs() {
@@ -950,11 +1009,534 @@ const app = createApp({
 
     exportTrendCsv(chartId) {
       window.open('/api/charts/' + chartId + '/export-csv', '_blank');
+    },
+
+    // ======================== 看板管理 ========================
+    clearRefreshTimers() {
+      if (!this.refreshTimers) return;
+      Object.keys(this.refreshTimers).forEach(id => {
+        clearInterval(this.refreshTimers[id]);
+      });
+      this.refreshTimers = {};
+    },
+
+    async loadDashboards() {
+      if (!this.currentSpaceId) {
+        this.dashboards = [];
+        this.activeDashboardId = null;
+        return;
+      }
+      this.loading.dashboards = true;
+      try {
+        const dbs = await this.api('GET', `/spaces/${this.currentSpaceId}/dashboards`);
+        this.dashboards = dbs;
+        
+        // 自动静默兜底，当空间中没有任何看板时，自动生成一个“默认看板”
+        if (this.dashboards.length === 0) {
+          await this.createDashboard('默认看板', true);
+          return;
+        }
+
+        // 设置默认选中的看板
+        if (!this.activeDashboardId || !this.dashboards.some(d => d.id === this.activeDashboardId)) {
+          this.switchDashboard(this.dashboards[0].id);
+        } else {
+          this.loadComponents();
+        }
+      } catch (e) {
+        /* handled */
+      } finally {
+        this.loading.dashboards = false;
+      }
+    },
+
+    async createDashboard(name = null, silent = false) {
+      if (!this.currentSpaceId) return;
+      const targetName = name || ('新看板 ' + (this.dashboards.length + 1));
+      try {
+        const db = await this.api('POST', `/spaces/${this.currentSpaceId}/dashboards`, {
+          name: targetName,
+          refresh_interval: 0
+        });
+        if (!silent) {
+          this.toast('看板创建成功');
+        }
+        this.activeDashboardId = db.id;
+        await this.loadDashboards();
+      } catch (e) {
+        /* handled */
+      }
+    },
+
+    async deleteDashboard(id) {
+      if (!id) return;
+      if (!confirm('确定要删除这个看板吗？其下的所有组件都将被永久清除。')) return;
+      
+      try {
+        await this.api('DELETE', `/dashboards/${id}`);
+        this.toast('看板已删除');
+        if (this.activeDashboardId === id) {
+          this.activeDashboardId = null;
+        }
+        await this.loadDashboards();
+      } catch (e) {
+        /* handled */
+      }
+    },
+
+    async switchDashboard(id) {
+      if (!id) return;
+      if (id === this.activeDashboardId) return;
+      
+      // 卫语句：如果有未保存的布局修改，且用户取消切换，则直接拦截返回
+      if (this.isDashboardLayoutDirty && !confirm('当前看板布局尚未保存，切换看板将丢失更改，是否继续切换？')) {
+        return;
+      }
+      
+      this.clearRefreshTimers();
+      this.activeDashboardId = id;
+      this.isDashboardEditing = false;
+      this.isDashboardLayoutDirty = false;
+      this.tableSelections = {};
+      
+      await this.loadComponents();
+      
+      await nextTick();
+      this.initGridStack();
+
+      const db = this.activeDashboard;
+      if (db && db.refresh_interval > 0) {
+        this.refreshTimers[db.id] = setInterval(() => {
+          if (!this.isDashboardEditing) {
+            this.activeDashboardComponents.forEach(comp => {
+              this.loadComponentData(comp.id);
+            });
+          }
+        }, db.refresh_interval * 1000);
+      }
+    },
+
+    async renameDashboard() {
+      if (!this.activeDashboardId) return;
+      const name = this.editDashboardName.trim();
+      if (!name) {
+        this.toast('看板名称不能为空', 'warning');
+        return;
+      }
+      try {
+        await this.api('PUT', `/dashboards/${this.activeDashboardId}`, { name });
+        this.toast('看板重命名成功');
+        this.isDashboardEditing = false;
+        await this.loadDashboards();
+      } catch (e) { /* handled */ }
+    },
+
+    async changeRefreshInterval(interval) {
+      if (!this.activeDashboardId) return;
+      try {
+        await this.api('PUT', `/dashboards/${this.activeDashboardId}`, {
+          refresh_interval: Number(interval)
+        });
+        this.toast('自动刷新设置已更新');
+        this.switchDashboard(this.activeDashboardId);
+      } catch (e) { /* handled */ }
+    },
+
+    startEditDashboardLayout() {
+      if (!this.activeDashboard) return;
+      this.isDashboardEditing = true;
+      this.isDashboardLayoutDirty = false;
+      this.editDashboardName = this.activeDashboard.name;
+      if (this.gridStackInstance) {
+        this.gridStackInstance.enable();
+      }
+    },
+
+    cancelEditDashboardLayout() {
+      // 卫语句：如果没有被修改，直接取消
+      if (!this.isDashboardLayoutDirty) {
+        this.isDashboardEditing = false;
+        if (this.gridStackInstance) {
+          this.gridStackInstance.disable();
+        }
+        this.loadComponents();
+        return;
+      }
+
+      // 卫语句：如果修改了但用户拒绝取消，直接拦截返回
+      if (!confirm('您对看板布局进行了修改，取消将丢失这些更改，是否确认取消？')) {
+        return;
+      }
+
+      this.isDashboardEditing = false;
+      this.isDashboardLayoutDirty = false;
+      if (this.gridStackInstance) {
+        this.gridStackInstance.disable();
+      }
+      this.loadComponents();
+    },
+
+    async saveDashboardLayout() {
+      if (!this.gridStackInstance) return;
+      try {
+        const items = this.gridStackInstance.save(false);
+        const layout = items.map(item => ({
+          id: Number(item.id),
+          position: { x: item.x, y: item.y, w: item.w, h: item.h }
+        }));
+        
+        await this.api('PUT', `/dashboards/${this.activeDashboardId}/components/layout`, { layout });
+        
+        this.toast('网格布局保存成功');
+        this.isDashboardEditing = false;
+        this.isDashboardLayoutDirty = false;
+        this.gridStackInstance.disable();
+        this.resizeAllPlots();
+      } catch (e) {
+        /* handled */
+      }
+    },
+
+    initGridStack() {
+      if (this.gridStackInstance) {
+        try {
+          this.gridStackInstance.destroy(false);
+        } catch (e) {}
+        this.gridStackInstance = null;
+      }
+
+      const gridEl = document.getElementById('gridstack-container');
+      if (!gridEl) return;
+
+      this.gridStackInstance = GridStack.init({
+        cellHeight: 'auto',
+        column: 12,
+        margin: 8,
+        acceptWidgets: false,
+        dragIn: false
+      }, gridEl);
+
+      if (this.isDashboardEditing) {
+        this.gridStackInstance.enable();
+      } else {
+        this.gridStackInstance.disable();
+      }
+
+      this.gridStackInstance.on('resizestop', (event, el) => {
+        const compId = el.getAttribute('gs-id');
+        const chartEl = document.getElementById('comp-chart-' + compId);
+        if (chartEl && typeof Plotly !== 'undefined') {
+          Plotly.Plots.resize(chartEl);
+        }
+      });
+
+      this.gridStackInstance.on('change', (event, items) => {
+        if (this.isDashboardEditing) {
+          this.isDashboardLayoutDirty = true;
+        }
+      });
+    },
+
+    async loadComponents() {
+      if (!this.activeDashboardId) {
+        this.activeDashboardComponents = [];
+        return;
+      }
+      try {
+        const comps = await this.api('GET', `/dashboards/${this.activeDashboardId}/components`);
+        this.activeDashboardComponents = comps.map(c => {
+          let position = {};
+          let config = {};
+          try {
+            position = typeof c.position === 'string' ? JSON.parse(c.position) : (c.position || {});
+          } catch(e) {}
+          try {
+            config = typeof c.config === 'string' ? JSON.parse(c.config) : (c.config || {});
+          } catch(e) {}
+          return { ...c, position, config };
+        });
+
+        this.activeDashboardComponents.forEach(comp => {
+          this.loadComponentData(comp.id);
+        });
+      } catch (e) {
+        /* handled */
+      }
+    },
+
+    async loadComponentData(compId) {
+      if (!compId) return;
+      const comp = this.activeDashboardComponents.find(c => c.id === compId);
+      if (!comp) return;
+
+      this.componentDataLoading[compId] = true;
+      try {
+        let filterCol = null;
+        let filterVal = null;
+
+        if (comp.dataset_id) {
+          const matchingTableSelection = Object.keys(this.tableSelections).find(otherId => {
+            const otherComp = this.activeDashboardComponents.find(c => c.id === Number(otherId));
+            return otherComp && otherComp.component_type === 'table' && otherComp.dataset_id === comp.dataset_id;
+          });
+          if (matchingTableSelection) {
+            const sel = this.tableSelections[matchingTableSelection];
+            filterCol = sel.filter_col;
+            filterVal = sel.filter_val;
+          }
+        }
+
+        const url = `/components/${compId}/data` + 
+          (filterCol && filterVal !== null ? `?filter_col=${encodeURIComponent(filterCol)}&filter_val=${encodeURIComponent(filterVal)}` : '');
+        
+        const data = await this.api('GET', url);
+        this.componentData[compId] = data;
+
+        if (comp.component_type === 'chart') {
+          await nextTick();
+          const chartElId = 'comp-chart-' + compId;
+          const chartEl = document.getElementById(chartElId);
+          if (chartEl && data.chart_json) {
+            Plotly.newPlot(chartEl, data.chart_json.data, data.chart_json.layout, {
+              responsive: true,
+              displayModeBar: false
+            });
+          }
+          if (data.trend_info) {
+            this.componentTrendInfos[compId] = data.trend_info;
+          } else {
+            this.componentTrendInfos[compId] = null;
+          }
+        }
+      } catch (e) {
+        /* handled */
+      } finally {
+        this.componentDataLoading[compId] = false;
+      }
+    },
+
+    handleTableRowClick(comp, row) {
+      if (!comp || !row) return;
+      const compId = comp.id;
+      
+      const currentSel = this.tableSelections[compId];
+      const columns = this.componentData[compId]?.columns || [];
+      if (columns.length === 0) return;
+      const filterCol = columns[0];
+      const filterVal = row[filterCol];
+
+      if (currentSel && currentSel.filter_val === filterVal) {
+        delete this.tableSelections[compId];
+      } else {
+        this.tableSelections[compId] = {
+          filter_col: filterCol,
+          filter_val: filterVal,
+          row_raw: row
+        };
+      }
+
+      this.activeDashboardComponents.forEach(otherComp => {
+        if (otherComp.id !== compId && otherComp.dataset_id === comp.dataset_id) {
+          this.loadComponentData(otherComp.id);
+        }
+      });
+    },
+
+    isRowSelected(compId, row) {
+      const sel = this.tableSelections[compId];
+      if (!sel) return false;
+      const columns = this.componentData[compId]?.columns || [];
+      if (columns.length === 0) return false;
+      return row[columns[0]] === sel.filter_val;
+    },
+
+    resizeAllPlots() {
+      if (typeof Plotly === 'undefined') return;
+      this.activeDashboardComponents.forEach(comp => {
+        if (comp.component_type === 'chart') {
+          const chartEl = document.getElementById('comp-chart-' + comp.id);
+          if (chartEl) {
+            Plotly.Plots.resize(chartEl);
+          }
+        }
+      });
+    },
+
+    // ======================== 组件表单弹框操作 ========================
+    openNewComponentModal() {
+      const defaultDatasetId = this.datasets.length > 0 ? this.datasets[0].id : '';
+      this.componentForm = {
+        id: null,
+        title: '',
+        component_type: 'chart',
+        dataset_id: defaultDatasetId,
+        config: {
+          chart_type: 'scatter',
+          x_col: '',
+          y_col: '',
+          y2_col: '',
+          trend_enabled: false,
+          kpi_col: '',
+          kpi_agg: 'sum',
+          kpi_decimals: 2,
+          kpi_unit: '',
+          kpi_target: null,
+          page_size: 10,
+          text_content: ''
+        }
+      };
+      this.componentDatasetColumns = [];
+      this.showComponentModal = true;
+      if (defaultDatasetId) {
+        this.loadComponentDatasetColumns(defaultDatasetId);
+      }
+    },
+
+    openEditComponentModal(comp) {
+      if (!comp) return;
+      this.componentForm = {
+        id: comp.id,
+        title: comp.title,
+        component_type: comp.component_type,
+        dataset_id: comp.dataset_id || '',
+        config: {
+          chart_type: comp.config?.chart_type || 'scatter',
+          x_col: comp.config?.x_col || '',
+          y_col: comp.config?.y_col || '',
+          y2_col: comp.config?.y2_col || '',
+          trend_enabled: comp.config?.trend_enabled || false,
+          kpi_col: comp.config?.kpi_col || '',
+          kpi_agg: comp.config?.kpi_agg || 'sum',
+          kpi_decimals: comp.config?.kpi_decimals !== undefined ? comp.config?.kpi_decimals : 2,
+          kpi_unit: comp.config?.kpi_unit || '',
+          kpi_target: comp.config?.kpi_target || null,
+          page_size: comp.config?.page_size || 10,
+          text_content: comp.config?.text_content || ''
+        }
+      };
+      this.componentDatasetColumns = [];
+      this.showComponentModal = true;
+      if (comp.dataset_id) {
+        this.loadComponentDatasetColumns(comp.dataset_id);
+      }
+    },
+
+    onComponentTypeChange() {
+      const type = this.componentForm.component_type;
+      if (type === 'text') {
+        this.componentForm.dataset_id = '';
+      } else if (!this.componentForm.dataset_id && this.datasets.length > 0) {
+        this.componentForm.dataset_id = this.datasets[0].id;
+        this.loadComponentDatasetColumns(this.componentForm.dataset_id);
+      }
+    },
+
+    onComponentDatasetChange() {
+      this.componentForm.config.x_col = '';
+      this.componentForm.config.y_col = '';
+      this.componentForm.config.y2_col = '';
+      this.componentForm.config.kpi_col = '';
+      this.loadComponentDatasetColumns(this.componentForm.dataset_id);
+    },
+
+    async loadComponentDatasetColumns(datasetId) {
+      if (!datasetId) {
+        this.componentDatasetColumns = [];
+        return;
+      }
+      try {
+        const preview = await this.api('GET', `/datasets/${datasetId}/preview?rows=1`);
+        this.componentDatasetColumns = preview.columns.map(c => ({
+          name: c,
+          type: preview.col_types[c] || 'text'
+        }));
+
+        if (this.componentForm.component_type === 'chart') {
+          if (this.componentDatasetColumns.length >= 2 && !this.componentForm.config.x_col) {
+            this.componentForm.config.x_col = this.componentDatasetColumns[0].name;
+            this.componentForm.config.y_col = this.componentDatasetColumns[1].name;
+          }
+        }
+        if (this.componentForm.component_type === 'kpi' && !this.componentForm.config.kpi_col) {
+          const numCol = this.componentDatasetColumns.find(c => ['int', 'float', 'number'].includes(c.type));
+          this.componentForm.config.kpi_col = numCol ? numCol.name : (this.componentDatasetColumns[0]?.name || '');
+        }
+      } catch (e) {
+        this.componentDatasetColumns = [];
+      }
+    },
+
+    async confirmSaveComponent() {
+      const form = this.componentForm;
+      if (!form.title.trim()) {
+        this.toast('请输入组件名称', 'warning');
+        return;
+      }
+      if (form.component_type !== 'text' && !form.dataset_id) {
+        this.toast('该组件类型必须关联数据集', 'warning');
+        return;
+      }
+      if (form.component_type === 'chart' && (!form.config.x_col || !form.config.y_col)) {
+        this.toast('图表组件必须配置 X 轴和 Y 轴字段', 'warning');
+        return;
+      }
+      if (form.component_type === 'kpi' && !form.config.kpi_col) {
+        this.toast('KPI 组件必须配置数值字段', 'warning');
+        return;
+      }
+
+      try {
+        const payload = {
+          title: form.title,
+          component_type: form.component_type,
+          dataset_id: form.component_type === 'text' ? null : form.dataset_id,
+          config: form.config
+        };
+
+        if (form.id) {
+          await this.api('PUT', `/components/${form.id}`, payload);
+          this.toast('组件配置更新成功');
+        } else {
+          // 仅传入 w, h，不传 x, y，实现 GridStack 在空闲位置自动排版
+          payload.position = { w: 4, h: 4 };
+          await this.api('POST', `/dashboards/${this.activeDashboardId}/components`, payload);
+          this.toast('组件添加成功');
+        }
+
+        this.showComponentModal = false;
+        await this.loadComponents();
+
+        await nextTick();
+        this.initGridStack();
+      } catch (e) {
+        /* handled */
+      }
+    },
+
+    async deleteComponent(compId) {
+      if (!compId) return;
+      if (!confirm('确定要从看板中移除这个组件吗？')) return;
+      try {
+        await this.api('DELETE', `/components/${compId}`);
+        this.toast('组件已成功移除');
+        await this.loadComponents();
+        await nextTick();
+        this.initGridStack();
+      } catch (e) {
+        /* handled */
+      }
     }
   },
 
   mounted() {
     this.checkAuthStatus();
+    window.addEventListener('beforeunload', (e) => {
+      // 卫语句：如果没有被修改，直接放行
+      if (!this.isDashboardLayoutDirty) return;
+      e.preventDefault();
+      e.returnValue = '当前看板布局已修改但尚未保存，确定要离开吗？';
+      return e.returnValue;
+    });
   }
 });
 
